@@ -1,6 +1,6 @@
 """
-AI 기반 글로벌 리스크 모니터링 시스템 - Complete Enhanced Version
-22개국 실시간 뉴스 모니터링 with AI 분석, 스케줄링, 캐싱
+AI 기반 글로벌 리스크 모니터링 시스템 - Complete Enhanced Version with 24h Dedup
+22개국 실시간 뉴스 모니터링 with AI 분석, 스케줄링, 24시간 기준 캐싱
 """
 
 import os
@@ -92,20 +92,37 @@ class NewsCache:
         self.company_cache_file = self.cache_dir / "company_news_cache.pkl"
         self.daily_cache_file = self.cache_dir / "daily_news_cache.pkl"
         
-    def load_company_cache(self) -> Set[str]:
-        """회사 관련 뉴스 캐시 로드"""
+    def load_company_cache(self) -> Dict[str, datetime]:
+        """회사 관련 뉴스 캐시 로드 (해시: 타임스탬프)"""
         if self.company_cache_file.exists():
             try:
                 with open(self.company_cache_file, 'rb') as f:
                     return pickle.load(f)
             except:
-                return set()
-        return set()
+                return {}
+        return {}
     
-    def save_company_cache(self, news_hashes: Set[str]):
+    def save_company_cache(self, news_cache: Dict[str, datetime]):
         """회사 관련 뉴스 캐시 저장"""
         with open(self.company_cache_file, 'wb') as f:
-            pickle.dump(news_hashes, f)
+            pickle.dump(news_cache, f)
+    
+    def clean_old_cache(self, news_cache: Dict[str, datetime], hours: int = 24) -> Dict[str, datetime]:
+        """오래된 캐시 항목 제거 (기본 24시간)"""
+        current_time = datetime.now()
+        cutoff_time = current_time - timedelta(hours=hours)
+        
+        cleaned_cache = {
+            hash_val: timestamp 
+            for hash_val, timestamp in news_cache.items() 
+            if timestamp > cutoff_time
+        }
+        
+        removed_count = len(news_cache) - len(cleaned_cache)
+        if removed_count > 0:
+            logger.info(f"🧹 {removed_count}개의 오래된 캐시 항목 제거 (24시간 이상)")
+        
+        return cleaned_cache
     
     def clear_daily_cache(self):
         """일일 캐시 초기화"""
@@ -1040,7 +1057,16 @@ class EnhancedAIRiskMonitoringSystem(AIRiskMonitoringSystem):
         super().__init__(config_path)
         self.mode = mode
         self.news_cache = NewsCache()
-        self.company_news_hashes = self.news_cache.load_company_cache()
+        
+        # 테스트 모드에서는 캐시 비활성화
+        if mode == 'test':
+            self.company_news_cache = {}  # 빈 딕셔너리로 초기화
+            logger.info("🧪 테스트 모드: 중복 체크 비활성화")
+        else:
+            # 일반 모드에서는 캐시 로드 및 24시간 이상 된 항목 정리
+            self.company_news_cache = self.news_cache.load_company_cache()
+            self.company_news_cache = self.news_cache.clean_old_cache(self.company_news_cache)
+            logger.info(f"📦 캐시 로드 완료: {len(self.company_news_cache)}개 항목 (24시간 이내)")
         
         logger.info(f"🚀 시스템 모드: {mode}")
         
@@ -1116,23 +1142,46 @@ class EnhancedAIRiskMonitoringSystem(AIRiskMonitoringSystem):
         return all_news
     
     def filter_new_company_news(self, news_list: List[NewsItem]) -> List[NewsItem]:
-        """새로운 회사 뉴스만 필터링"""
+        """새로운 회사 뉴스만 필터링 (24시간 기준)"""
+        # 테스트 모드에서는 모든 뉴스 반환
+        if self.mode == 'test':
+            logger.info("🧪 테스트 모드: 중복 체크 건너뜀")
+            return news_list
+        
         new_news = []
-        new_hashes = set()
+        current_time = datetime.now()
+        updated_cache = {}
         
         for news in news_list:
-            if news.news_hash not in self.company_news_hashes:
+            # 24시간 이내에 이미 본 뉴스인지 체크
+            if news.news_hash in self.company_news_cache:
+                cached_time = self.company_news_cache[news.news_hash]
+                time_diff = current_time - cached_time
+                
+                if time_diff < timedelta(hours=24):
+                    # 24시간 이내 중복
+                    logger.debug(f"⏭️ 24시간 이내 중복 뉴스 건너뜀: {news.title[:50]}...")
+                    updated_cache[news.news_hash] = cached_time  # 기존 시간 유지
+                else:
+                    # 24시간 경과 - 새로운 뉴스로 처리
+                    new_news.append(news)
+                    updated_cache[news.news_hash] = current_time
+                    logger.info(f"🔄 24시간 경과 뉴스 재수집: {news.title[:50]}...")
+            else:
+                # 완전히 새로운 뉴스
                 new_news.append(news)
-                new_hashes.add(news.news_hash)
+                updated_cache[news.news_hash] = current_time
                 logger.info(f"🆕 새로운 뉴스 발견: {news.title[:50]}...")
         
-        # 캐시 업데이트
-        if new_hashes:
-            self.company_news_hashes.update(new_hashes)
-            self.news_cache.save_company_cache(self.company_news_hashes)
-            logger.info(f"✅ {len(new_news)}건의 새로운 회사 뉴스 발견")
-        else:
-            logger.info("ℹ️ 새로운 회사 뉴스 없음")
+        # 캐시 업데이트 (테스트 모드가 아닐 때만)
+        if self.mode != 'test' and updated_cache:
+            # 24시간 이상 된 캐시 정리 후 저장
+            self.company_news_cache = self.news_cache.clean_old_cache(updated_cache)
+            self.news_cache.save_company_cache(self.company_news_cache)
+            logger.info(f"✅ {len(new_news)}건의 새로운/갱신된 회사 뉴스")
+        
+        if not new_news and self.mode != 'test':
+            logger.info("ℹ️ 24시간 이내 중복 뉴스만 있음")
         
         return new_news
     
@@ -1171,7 +1220,7 @@ class EnhancedAIRiskMonitoringSystem(AIRiskMonitoringSystem):
                     <!-- 헤더 -->
                     <tr>
                         <td style="background-color: #6b46c1; padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
-                            <h1 style="color: #ffffff; margin: 0; font-size: 28px;">🌍 G/O실 글로벌 리스크 모니터링</h1>
+                            <h1 style="color: #ffffff; margin: 0; font-size: 28px;">🌍 글로벌 리스크 모니터링</h1>
                             <p style="color: #ffffff; margin: 10px 0 0 0; font-size: 14px;">
                                 {datetime.now().strftime('%Y년 %m월 %d일')} | Samsung C&T
                             </p>
@@ -1388,9 +1437,11 @@ class EnhancedAIRiskMonitoringSystem(AIRiskMonitoringSystem):
             with open(html_file, 'w', encoding='utf-8') as f:
                 f.write(html_content)
             
-            # 이메일 전송
-            if self.email_config['sender_email'] and self.email_config['recipients']:
+            # 이메일 전송 (테스트 모드가 아닐 때만)
+            if self.mode != 'test' and self.email_config['sender_email'] and self.email_config['recipients']:
                 self.send_email_report(email_html, final_news, use_email_version=True)
+            elif self.mode == 'test':
+                logger.info("🧪 테스트 모드: 이메일 전송 건너뜀")
             
             logger.info("✅ 일일 모니터링 완료")
             return True
@@ -1594,4 +1645,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
