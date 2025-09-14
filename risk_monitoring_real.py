@@ -241,48 +241,63 @@ Reason: (Brief explanation)"""
             return False, None
     
     def analyze_risk_batch(self, news_list: List[NewsItem], batch_size: int = 5) -> List[NewsItem]:
-        """배치 단위로 리스크 분석 - 삼성 공식 출처 제외"""
+        """배치 단위로 리스크 분석"""
         logger.info(f"🤖 AI 리스크 분석 시작 ({len(news_list)}건)...")
         
-        # 삼성 공식 출처 필터링 제거 - 모든 뉴스 분석
-        filtered_list = news_list  # 필터링 없이 전체 리스트 사용
-        
+        filtered_list = news_list
         analyzed_news = []
         
         # 배치 처리
         for i in range(0, len(filtered_list), batch_size):
             batch = filtered_list[i:i+batch_size]
-            prompt = self._create_risk_analysis_prompt(batch)
             
-            try:
-                response = self.model.generate_content(prompt)
-                results = self._parse_risk_response(response.text, batch)
-                analyzed_news.extend(results)
-                
-                time.sleep(1)
-                logger.info(f"  - 분석 진행: {min(i+batch_size, len(filtered_list))}/{len(filtered_list)}")
-                
-            except Exception as e:
-                logger.error(f"❌ AI 분석 오류: {e}")
-                for news in batch:
+            # 회사 뉴스는 AI 분석 없이 바로 COMPANY로 분류
+            company_batch = []
+            regular_batch = []
+            
+            for news in batch:
+                if news.country_code in ["samsung", "global_samsung"]:
+                    news.risk_level = 'COMPANY'
                     news.risk_score = 0
-                    news.risk_level = ""
-                analyzed_news.extend(batch)
+                    news.risk_category = 'Company News'
+                    news.ai_analysis_timestamp = datetime.now().isoformat()
+                    company_batch.append(news)
+                else:
+                    regular_batch.append(news)
+            
+            # 일반 뉴스만 AI 분석
+            if regular_batch:
+                prompt = self._create_risk_analysis_prompt(regular_batch)
+                
+                try:
+                    response = self.model.generate_content(prompt)
+                    results = self._parse_risk_response(response.text, regular_batch)
+                    analyzed_news.extend(results)
+                    
+                    time.sleep(1)
+                    logger.info(f"  - 분석 진행: {min(i+batch_size, len(filtered_list))}/{len(filtered_list)}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ AI 분석 오류: {e}")
+                    for news in regular_batch:
+                        news.risk_score = 0
+                        news.risk_level = ""
+                    analyzed_news.extend(regular_batch)
+            
+            # 회사 뉴스 추가
+            analyzed_news.extend(company_batch)
         
-        # 리스크 점수 기준으로 필터링 (LOW도 포함)
+        # 리스크 점수 기준으로 필터링
         filtered_news = []
         for n in analyzed_news:
-            # 회사 뉴스는 점수와 관계없이 포함
-            if n.country_code == "samsung":
-                if n.risk_score < self.risk_thresholds['LOW']:
-                    n.risk_level = 'COMPANY'  # 새로운 레벨 추가
+            # 회사 뉴스는 무조건 포함
+            if n.risk_level == 'COMPANY':
                 filtered_news.append(n)
             # 일반 뉴스는 LOW(20점) 이상만 포함
             elif n.risk_score >= self.risk_thresholds['LOW']:
                 filtered_news.append(n)
-
         
-        logger.info(f"✅ AI 분석 완료: {len(filtered_news)}건이 MEDIUM 이상 리스크")
+        logger.info(f"✅ AI 분석 완료: {len(filtered_news)}건 처리")
         return filtered_news
     
     def _create_risk_analysis_prompt(self, news_batch: List[NewsItem]) -> str:
@@ -379,20 +394,20 @@ NEWS LIST:
         return results
     
     def summarize_and_translate(self, news_list: List[NewsItem]) -> List[NewsItem]:
-        """뉴스 요약 및 한국어 번역 - HIGH, MEDIUM, LOW 모두 처리"""
+        """뉴스 요약 및 한국어 번역"""
         logger.info("📝 뉴스 요약 및 번역 시작...")
         
-        # 리스크 레벨이 있는 뉴스만 카운트
+        # 리스크 레벨이 있는 뉴스만 카운트 (COMPANY 포함)
         total_items = len([n for n in news_list if n.risk_level in ['HIGH', 'MEDIUM', 'LOW', 'COMPANY']])
         processed = 0
         
         for news in news_list:
-            if not news.risk_level:  # 리스크 레벨이 없으면 스킵
+            if not news.risk_level:
                 continue
             
             try:
+                # HIGH는 전체 번역, 나머지는 요약만
                 if news.risk_level == 'HIGH':
-                    # HIGH: 제목 번역 + 요약 + 전체 번역
                     prompt = f"""Please translate the title and content, then summarize the following news into Korean.
 
     Title: {news.title}
@@ -410,17 +425,31 @@ NEWS LIST:
     [Full Translation]
     (Complete translation of the content in natural Korean)"""
                     
-                    response = self.model.generate_content(prompt)
-                    result = response.text
-                    
-                    # 결과 파싱
-                    if '[Title Translation]' in result:
+                else:  # MEDIUM, LOW, COMPANY
+                    prompt = f"""Please translate the title and summarize the following news in 3-4 sentences in Korean.
+
+    Title: {news.title}
+    Content: {news.snippet}
+    Date: {news.date}
+    Country: {news.country}
+
+    Please respond in the following format:
+    [Title Translation]
+    (Korean translation of the title)
+
+    [Summary]
+    (3-4 sentences summarizing key points in Korean)"""
+                
+                response = self.model.generate_content(prompt)
+                result = response.text
+                
+                # 결과 파싱
+                if '[Title Translation]' in result:
+                    if news.risk_level == 'HIGH':
                         parts = result.split('[Title Translation]')[1]
-                        
                         if '[Summary]' in parts:
                             title_ko = parts.split('[Summary]')[0].strip()
                             remaining = parts.split('[Summary]')[1]
-                            
                             if '[Full Translation]' in remaining:
                                 summary = remaining.split('[Full Translation]')[0].strip()
                                 translation = remaining.split('[Full Translation]')[1].strip()
@@ -435,50 +464,25 @@ NEWS LIST:
                         news.ai_title_ko = title_ko
                         news.ai_summary_ko = summary
                         news.ai_full_translation_ko = translation
-                    
-                elif news.risk_level in ['MEDIUM', 'LOW', 'COMPANY']:
-                    # MEDIUM, LOW: 제목 번역 + 요약만
-                    prompt = f"""Please translate the title and summarize the following news in 3-4 sentences in Korean.
-
-    Title: {news.title}
-    Content: {news.snippet}
-    Date: {news.date}
-    Country: {news.country}
-
-    Please respond in the following format:
-    [Title Translation]
-    (Korean translation of the title)
-
-    [Summary]
-    (3-4 sentences summarizing key points in Korean)"""
-                    
-                    response = self.model.generate_content(prompt)
-                    result = response.text
-                    
-                    # 결과 파싱
-                    if '[Title Translation]' in result and '[Summary]' in result:
-                        title_ko = result.split('[Title Translation]')[1].split('[Summary]')[0].strip()
-                        summary = result.split('[Summary]')[1].strip()
                         
-                        news.ai_title_ko = title_ko
-                        news.ai_summary_ko = summary
-                    else:
-                        # 파싱 실패 시 전체를 요약으로 사용
-                        news.ai_title_ko = news.title
-                        news.ai_summary_ko = result.strip()
+                    else:  # MEDIUM, LOW, COMPANY
+                        if '[Summary]' in result:
+                            title_ko = result.split('[Title Translation]')[1].split('[Summary]')[0].strip()
+                            summary = result.split('[Summary]')[1].strip()
+                            news.ai_title_ko = title_ko
+                            news.ai_summary_ko = summary
+                        else:
+                            news.ai_title_ko = news.title
+                            news.ai_summary_ko = result.strip()
                 
-                # API 호출 간격
                 time.sleep(0.5)
-                
                 processed += 1
                 
-                # 진행 상황 로그 (10개마다)
                 if processed % 10 == 0:
                     logger.info(f"  - 번역 진행: {processed}/{total_items}")
                     
             except Exception as e:
                 logger.error(f"번역/요약 오류 ({news.title[:50]}...): {e}")
-                # 오류 시 기본값 설정
                 news.ai_title_ko = news.title
                 news.ai_summary_ko = "번역 실패"
         
@@ -600,7 +604,8 @@ class AIRiskMonitoringSystem:
             'smtp_port': int(os.getenv('SMTP_PORT', 587)),
             'sender_email': os.getenv('SENDER_EMAIL', ''),
             'sender_password': os.getenv('SENDER_PASSWORD', ''),
-            'recipients': []
+            'recipients': [],
+            'admin_email': os.getenv('ADMIN_EMAIL', '')  # 관리자 이메일 추가
         }
         
         env_recipients = os.getenv('RECIPIENT_EMAILS', '')
@@ -732,15 +737,26 @@ class AIRiskMonitoringSystem:
         
         # 2. 회사 키워드 뉴스 수집 (해외만) - 수정됨
         logger.info("\n🏢 회사 키워드 뉴스 수집 시작 (해외만)")
+        
+        # 제외할 한국 언론사
         korean_sources = ['yonhap', '연합', 'korea', 'chosun', '조선', 
                         'joongang', '중앙', 'hankyoreh', '한겨레', 'donga', '동아',
                         'hankook', '한국', 'maeil', '매일', 'seoul', '서울']
         
+        # 제외할 회사 공식 채널
+        official_sources = ['samsung newsroom', '삼성 뉴스룸', 'samsung.com', 
+                        'samsungcnt.com', 'samsung c&t newsroom']
+        
+        # 건설업 관련 키워드 (필터링용)
+        construction_keywords = ['construction', 'building', 'infrastructure', 'engineering',
+                                'project', 'development', 'contractor', 'architecture',
+                                '건설', '건축', '공사', '시공', '프로젝트', '개발']
+        
         for idx, keyword in enumerate(self.company_keywords, 1):
             logger.info(f"[{idx}/{len(self.company_keywords)}] {keyword}")
             
-            # 회사명만 검색, 한국 제외
-            query = f'"{keyword}" -site:kr -korea -한국'
+            # 건설업 관련 키워드 포함한 검색어
+            query = f'"{keyword}" (construction OR building OR project OR infrastructure) -site:kr -korea -한국 -newsroom'
             
             try:
                 params = {
@@ -748,8 +764,8 @@ class AIRiskMonitoringSystem:
                     "engine": "google_news",
                     "q": query,
                     "when": "7d",
-                    "gl": "us",  # 글로벌 검색 (미국 기준)
-                    "hl": "en"   # 영어 결과 우선
+                    "gl": "us",
+                    "hl": "en"
                 }
                 
                 search = self.GoogleSearch(params)
@@ -760,16 +776,37 @@ class AIRiskMonitoringSystem:
                 if "news_results" in response:
                     company_news = []
                     
-                    for item in response["news_results"][:20]:  # 20건으로 증가
-                        # 날짜 필터링 (7일 이내)
+                    for item in response["news_results"][:30]:  # 더 많이 가져와서 필터링
+                        # 날짜 필터링
                         date_str = item.get('date', '')
-                        if not self._is_within_days(date_str, 7):  # 변경된 부분
+                        if not self._is_within_days(date_str, 7):
                             continue
                         
-                        # 한국 언론사 필터링
+                        # 소스 필터링
                         source = item.get('source', {}).get('name', '').lower()
+                        
+                        # 한국 언론사 제외
                         if any(ks in source for ks in korean_sources):
                             logger.debug(f"  ✗ 한국 언론사 제외: {source}")
+                            continue
+                        
+                        # 회사 공식 채널 제외
+                        if any(os in source for os in official_sources):
+                            logger.debug(f"  ✗ 회사 공식 채널 제외: {source}")
+                            continue
+                        
+                        # 제목과 내용에서 건설업 관련성 체크
+                        title = item.get('title', '').lower()
+                        snippet = item.get('snippet', '').lower()
+                        
+                        # 건설업 관련 키워드가 하나도 없으면 제외
+                        has_construction_relevance = any(
+                            ck.lower() in title or ck.lower() in snippet 
+                            for ck in construction_keywords
+                        )
+                        
+                        if not has_construction_relevance:
+                            logger.debug(f"  ✗ 건설업 무관: {item.get('title', '')[:50]}...")
                             continue
                         
                         news_item = NewsItem(
@@ -786,11 +823,15 @@ class AIRiskMonitoringSystem:
                             collected_at=datetime.now().isoformat()
                         )
                         company_news.append(news_item)
+                        
+                        # 최대 10건만 수집
+                        if len(company_news) >= 10:
+                            break
                     
-                    logger.info(f"  - {keyword}: {len(company_news)}건 수집 (한국 제외)")
+                    logger.info(f"  - {keyword}: {len(company_news)}건 수집 (건설업 관련, 공식채널 제외)")
                     all_news.extend(company_news)
                     self.stats['news_collected'] += len(company_news)
-                
+                    
             except Exception as e:
                 logger.error(f"회사 키워드 검색 오류 ({keyword}): {e}")
                 self.stats['errors'] += 1
@@ -918,7 +959,7 @@ class AIRiskMonitoringSystem:
             
             <!-- 헤더 -->
             <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px; text-align: center;">
-                <h1 style="color: #ffffff; margin: 0 0 10px 0; font-size: 32px;">🌍 글로벌 리스크 모니터링 리포트</h1>
+                <h1 style="color: #ffffff; margin: 0 0 10px 0; font-size: 32px;">🌍 G/O실 글로벌 리스크 모니터링 리포트</h1>
                 <div style="display: inline-block; background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px; color: white; font-size: 14px;">
                     Powered by Gemini 2.0 Flash
                 </div>
@@ -963,7 +1004,7 @@ class AIRiskMonitoringSystem:
                             <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">MEDIUM</th>
                             <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">LOW</th>
                             <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">COMPANY</th>
-                            <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">이계</th>
+                            <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">소계</th>
                         </tr>
                     </thead>
                     <tbody>"""
@@ -1042,21 +1083,27 @@ class AIRiskMonitoringSystem:
         return html
     
     def _create_ai_news_card(self, news: NewsItem, risk_class: str) -> str:
-        """뉴스 카드 HTML 생성 - 한국어 제목 표시"""
+        """뉴스 카드 HTML 생성"""
         import html
         
         # 한국어 제목 우선 사용
         title_to_display = news.ai_title_ko if news.ai_title_ko else news.title
         
         # 리스크 레벨에 따른 색상
-        if risk_class == 'high':
-            border_color = '#dc3545'
-        elif risk_class == 'medium':
-            border_color = '#ffc107'
-        elif risk_class == 'company':  # 회사 뉴스 색상 추가
-            border_color = '#6c757d'
-        else:  # low
-            border_color = '#28a745'
+        color_map = {
+            'high': '#dc3545',
+            'medium': '#ffc107', 
+            'low': '#28a745',
+            'company': '#6c757d'
+        }
+        border_color = color_map.get(risk_class, '#6c757d')
+        
+        # 리스크 점수 표시 - COMPANY는 점수 대신 카테고리만 표시
+        if risk_class == 'company':
+            risk_info = f"<strong>카테고리:</strong> 회사 관련 뉴스"
+        else:
+            risk_info = f"""<strong>리스크 점수:</strong> {news.risk_score:.0f} | 
+                            <strong>카테고리:</strong> {news.risk_category or 'Other'}"""
         
         return f"""
         <div style="background: white; border: 1px solid #e9ecef; border-left: 5px solid {border_color}; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
@@ -1065,8 +1112,7 @@ class AIRiskMonitoringSystem:
                 📍 {news.country_ko or news.country} | 📰 {html.escape(news.source)} | 📅 {news.date}
             </p>
             <p style="margin: 10px 0;">
-                <strong>리스크 점수:</strong> {news.risk_score:.0f} | 
-                <strong>카테고리:</strong> {news.risk_category or 'Other'}
+                {risk_info}
             </p>
             <div style="background: #f8f9fa; padding: 10px; border-radius: 4px; margin: 15px 0;">
                 <strong>AI 요약:</strong><br>
@@ -1222,15 +1268,39 @@ class AIRiskMonitoringSystem:
             analyzed_news = self.analyzer.analyze_risk_batch(unique_news)
             final_news = self.analyzer.summarize_and_translate(analyzed_news)
             
-            # 긴급 이메일 리포트 생성 및 전송
-            if final_news:
-                html_content = self.create_urgent_company_report(final_news)
+            # 리스크 레벨별 분류
+            high_risk = [n for n in final_news if n.risk_level == 'HIGH']
+            medium_risk = [n for n in final_news if n.risk_level == 'MEDIUM']
+            low_risk = [n for n in final_news if n.risk_level == 'LOW']
+            company_level = [n for n in final_news if n.risk_level == 'COMPANY']
+            
+            # 1. 일반 수신자: HIGH 또는 MEDIUM이 있는 경우만 전송
+            if (high_risk or medium_risk) and self.email_config['recipients']:
+                # HIGH와 MEDIUM만 포함한 리포트 생성
+                urgent_news = high_risk + medium_risk
+                html_content = self.create_urgent_company_report(urgent_news, report_type='urgent')
                 
-                # 이메일 전송
-                if self.email_config['sender_email'] and self.email_config['recipients']:
-                    subject = f"[긴급] 삼성물산 관련 뉴스 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-                    self.send_urgent_email(html_content, subject)
-                    logger.info(f"📧 긴급 알림 이메일 전송 완료 ({len(final_news)}건)")
+                risk_text = []
+                if high_risk:
+                    risk_text.append(f"HIGH {len(high_risk)}건")
+                if medium_risk:
+                    risk_text.append(f"MEDIUM {len(medium_risk)}건")
+                
+                subject = f"[긴급] 삼성물산 관련 뉴스 - {' / '.join(risk_text)} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                
+                # 일반 수신자에게 전송
+                self.send_email_to_recipients(html_content, subject, self.email_config['recipients'])
+                logger.info(f"📧 긴급 알림 이메일 전송 완료 (일반 수신자: {len(urgent_news)}건)")
+            
+            # 2. 관리자: 모든 뉴스 전송 (항상)
+            if final_news and self.email_config.get('admin_email'):
+                html_content_admin = self.create_urgent_company_report(final_news, report_type='admin')
+                
+                subject_admin = f"[관리자] 삼성물산 모니터링 - 전체 {len(final_news)}건 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                
+                # 관리자에게 전송
+                self.send_email_to_recipients(html_content_admin, subject_admin, [self.email_config['admin_email']])
+                logger.info(f"📧 관리자 전체 리포트 전송 완료 ({len(final_news)}건)")
             
             # 캐시 저장
             company_cache.save_cache()
@@ -1242,21 +1312,28 @@ class AIRiskMonitoringSystem:
             return False
 
     def collect_company_news_only(self) -> List[NewsItem]:
-        """회사 관련 뉴스만 수집 (3시간 주기용) - 해외만"""
+        """회사 관련 뉴스만 수집 (3시간 주기용)"""
         all_news = []
         
-        # 한국 언론사 리스트
+        # 제외할 소스들
         korean_sources = ['yonhap', '연합', 'korea', 'chosun', '조선', 
                         'joongang', '중앙', 'hankyoreh', '한겨레', 'donga', '동아',
                         'hankook', '한국', 'maeil', '매일', 'seoul', '서울']
         
-        # 1. 회사 키워드 뉴스 (해외만)
+        official_sources = ['samsung newsroom', '삼성 뉴스룸', 'samsung.com', 
+                        'samsungcnt.com', 'samsung c&t newsroom']
+        
+        construction_keywords = ['construction', 'building', 'infrastructure', 'engineering',
+                            'project', 'development', 'contractor', 'architecture',
+                            '건설', '건축', '공사', '시공', '프로젝트', '개발']
+        
         logger.info("\n🏢 회사 키워드 뉴스 수집 시작 (해외만)")
+        
         for idx, keyword in enumerate(self.company_keywords, 1):
             logger.info(f"[{idx}/{len(self.company_keywords)}] {keyword}")
             
-            # 회사명만, 한국 제외
-            query = f'"{keyword}" -site:kr -korea -한국'
+            # 건설업 관련 검색어
+            query = f'"{keyword}" (construction OR building OR project OR infrastructure) -site:kr -korea -한국 -newsroom'
             
             try:
                 params = {
@@ -1272,14 +1349,30 @@ class AIRiskMonitoringSystem:
                 response = search.get_dict()
                 
                 if "news_results" in response:
-                    for item in response["news_results"][:20]:
+                    for item in response["news_results"][:30]:
                         # 날짜 체크
-                        if not self._is_within_days(item.get('date', ''), 7):  # 변경된 부분
+                        if not self._is_within_days(item.get('date', ''), 7):
                             continue
                         
-                        # 한국 언론사 필터링
                         source = item.get('source', {}).get('name', '').lower()
+                        
+                        # 필터링
                         if any(ks in source for ks in korean_sources):
+                            continue
+                        
+                        if any(os in source for os in official_sources):
+                            continue
+                        
+                        # 건설업 관련성 체크
+                        title = item.get('title', '').lower()
+                        snippet = item.get('snippet', '').lower()
+                        
+                        has_construction_relevance = any(
+                            ck.lower() in title or ck.lower() in snippet 
+                            for ck in construction_keywords
+                        )
+                        
+                        if not has_construction_relevance:
                             continue
                         
                         news_item = NewsItem(
@@ -1295,7 +1388,10 @@ class AIRiskMonitoringSystem:
                             collected_at=datetime.now().isoformat()
                         )
                         all_news.append(news_item)
-                
+                        
+                        if len(all_news) >= 10:  # 최대 10건
+                            break
+                    
             except Exception as e:
                 logger.error(f"회사 키워드 검색 오류: {e}")
             
@@ -1328,60 +1424,104 @@ class AIRiskMonitoringSystem:
         logger.info(f"\n✅ 회사 관련 뉴스 {len(all_news)}건 수집 완료")
         return all_news
 
-    def create_urgent_company_report(self, news_list: List[NewsItem]) -> str:
-        """긴급 회사 뉴스 이메일 리포트 생성"""
-        # HIGH, MEDIUM만 필터링
+    def create_urgent_company_report(self, news_list: List[NewsItem], report_type: str = 'urgent') -> str:
+        """긴급 회사 뉴스 이메일 리포트 생성
+        
+        Args:
+            news_list: 뉴스 리스트
+            report_type: 'urgent' (HIGH/MEDIUM만) 또는 'admin' (전체)
+        """
+        # 리스크 레벨별 분류
         high_risk = [n for n in news_list if n.risk_level == 'HIGH']
         medium_risk = [n for n in news_list if n.risk_level == 'MEDIUM']
+        low_risk = [n for n in news_list if n.risk_level == 'LOW']
+        company_news = [n for n in news_list if n.risk_level == 'COMPANY']
+        
+        # 전체 뉴스 개수
+        total_news = len(news_list)
+        
+        # 리포트 타입에 따른 제목과 색상
+        if report_type == 'admin':
+            header_color = '#17a2b8'  # 청록색 (관리자용)
+            header_title = "📊 삼성물산 전체 모니터링 리포트 (관리자)"
+            alert_message = f"전체 {total_news}건의 뉴스가 감지되었습니다."
+        else:
+            header_color = '#dc3545' if high_risk else '#ffc107'
+            header_title = "⚠️ 삼성물산 관련 긴급 뉴스"
+            alert_message = f"중요도 높은 뉴스 {len(high_risk) + len(medium_risk)}건이 감지되었습니다."
         
         html = f"""<!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
-        <title>삼성물산 관련 긴급 뉴스</title>
+        <title>삼성물산 관련 뉴스</title>
     </head>
     <body style="margin: 0; padding: 0; font-family: 'Malgun Gothic', Arial, sans-serif; background-color: #f4f4f4;">
         <div style="max-width: 700px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-            <div style="background-color: #dc3545; padding: 25px; text-align: center;">
-                <h1 style="color: #ffffff; margin: 0; font-size: 26px;">⚠️ 삼성물산 관련 긴급 뉴스</h1>
+            <div style="background-color: {header_color}; padding: 25px; text-align: center;">
+                <h1 style="color: #ffffff; margin: 0; font-size: 26px;">{header_title}</h1>
                 <p style="color: #ffffff; margin: 10px 0 0 0; font-size: 14px;">
-                    {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')} | {len(high_risk) + len(medium_risk)}건 감지
+                    {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')} | {total_news}건 감지
                 </p>
             </div>
             
             <div style="padding: 25px;">
                 <div style="background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin-bottom: 20px;">
                     <p style="margin: 0; color: #856404;">
-                        <strong>알림:</strong> 삼성물산 관련 새로운 뉴스 {len(high_risk) + len(medium_risk)}건이 감지되었습니다.
+                        <strong>알림:</strong> {alert_message}
+                    </p>
+                    <p style="margin: 5px 0 0 0; color: #856404; font-size: 13px;">
+                        HIGH: {len(high_risk)}건 | MEDIUM: {len(medium_risk)}건 | LOW: {len(low_risk)}건 | COMPANY: {len(company_news)}건
                     </p>
                 </div>"""
         
-        for idx, news in enumerate(high_risk + medium_risk, 1):
-            title_to_display = news.ai_title_ko if news.ai_title_ko else news.title
-            border_color = '#dc3545' if news.risk_level == 'HIGH' else '#ffc107'
-            
+        news_counter = 1
+        
+        # HIGH RISK 뉴스
+        if high_risk:
             html += f"""
-            <div style="border: 1px solid #dee2e6; border-left: 5px solid {border_color}; padding: 20px; margin-bottom: 20px; background-color: #f8f9fa;">
-                <h3 style="margin: 0 0 10px 0; color: #333; font-size: 18px;">
-                    {idx}. {title_to_display}
-                </h3>
-                <div style="margin: 10px 0; color: #666; font-size: 13px;">
-                    📰 {news.source} | 📅 {news.date}
-                </div>
-                <div style="margin: 15px 0; padding: 10px; background-color: #ffffff; border-radius: 4px;">
-                    <strong style="color: {border_color};">리스크 점수: {news.risk_score:.0f}</strong> | 
-                    카테고리: {news.risk_category or 'Company News'}
-                </div>
-                <div style="margin: 15px 0; padding: 10px; background-color: #ffffff; border-radius: 4px;">
-                    <strong>AI 요약:</strong><br>
-                    <p style="margin: 5px 0; color: #333; line-height: 1.6;">
-                        {news.ai_summary_ko or '요약 생성 중...'}
-                    </p>
-                </div>
-                <a href="{news.link}" style="display: inline-block; margin-top: 10px; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;">
-                    원문 보기 →
-                </a>
-            </div>"""
+                <h2 style="color: #dc3545; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #dc3545; padding-bottom: 5px;">
+                    🔴 HIGH RISK ({len(high_risk)})
+                </h2>"""
+            
+            for news in high_risk:
+                html += self._create_urgent_news_item(news, news_counter, '#dc3545')
+                news_counter += 1
+        
+        # MEDIUM RISK 뉴스
+        if medium_risk:
+            html += f"""
+                <h2 style="color: #ffc107; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #ffc107; padding-bottom: 5px;">
+                    🟡 MEDIUM RISK ({len(medium_risk)})
+                </h2>"""
+            
+            for news in medium_risk:
+                html += self._create_urgent_news_item(news, news_counter, '#ffc107')
+                news_counter += 1
+        
+        # 관리자 리포트인 경우에만 LOW와 COMPANY 포함
+        if report_type == 'admin':
+            # LOW RISK 뉴스
+            if low_risk:
+                html += f"""
+                    <h2 style="color: #28a745; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #28a745; padding-bottom: 5px;">
+                        🟢 LOW RISK ({len(low_risk)})
+                    </h2>"""
+                
+                for news in low_risk:
+                    html += self._create_urgent_news_item(news, news_counter, '#28a745')
+                    news_counter += 1
+            
+            # COMPANY 뉴스
+            if company_news:
+                html += f"""
+                    <h2 style="color: #6c757d; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #6c757d; padding-bottom: 5px;">
+                        🏢 COMPANY NEWS ({len(company_news)})
+                    </h2>"""
+                
+                for news in company_news:
+                    html += self._create_urgent_news_item(news, news_counter, '#6c757d')
+                    news_counter += 1
         
         html += """
             </div>
@@ -1395,6 +1535,38 @@ class AIRiskMonitoringSystem:
     </body>
     </html>"""
         return html
+
+    def _create_urgent_news_item(self, news: NewsItem, idx: int, border_color: str) -> str:
+        """개별 뉴스 아이템 HTML 생성 (헬퍼 메소드)"""
+        title_to_display = news.ai_title_ko if news.ai_title_ko else news.title
+        
+        # 리스크 정보 표시 (COMPANY는 카테고리만)
+        if news.risk_level == 'COMPANY':
+            risk_info = f"카테고리: {news.risk_category or 'Company News'}"
+        else:
+            risk_info = f"<strong style='color: {border_color};'>리스크 점수: {news.risk_score:.0f}</strong> | 카테고리: {news.risk_category or 'Other'}"
+        
+        return f"""
+        <div style="border: 1px solid #dee2e6; border-left: 5px solid {border_color}; padding: 20px; margin-bottom: 20px; background-color: #f8f9fa;">
+            <h3 style="margin: 0 0 10px 0; color: #333; font-size: 18px;">
+                {idx}. {title_to_display}
+            </h3>
+            <div style="margin: 10px 0; color: #666; font-size: 13px;">
+                📰 {news.source} | 📅 {news.date}
+            </div>
+            <div style="margin: 15px 0; padding: 10px; background-color: #ffffff; border-radius: 4px;">
+                {risk_info}
+            </div>
+            <div style="margin: 15px 0; padding: 10px; background-color: #ffffff; border-radius: 4px;">
+                <strong>AI 요약:</strong><br>
+                <p style="margin: 5px 0; color: #333; line-height: 1.6;">
+                    {news.ai_summary_ko or '요약 생성 중...'}
+                </p>
+            </div>
+            <a href="{news.link}" style="display: inline-block; margin-top: 10px; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;">
+                원문 보기 →
+            </a>
+        </div>"""
 
     def send_urgent_email(self, html_content: str, subject: str) -> bool:
         """긴급 이메일 전송"""
@@ -1413,6 +1585,29 @@ class AIRiskMonitoringSystem:
                 server.send_message(msg)
                 
             logger.info(f"📧 긴급 이메일 전송 성공")
+            return True
+            
+        except Exception as e:
+            logger.error(f"이메일 전송 실패: {e}")
+            return False
+
+    def send_email_to_recipients(self, html_content: str, subject: str, recipients: List[str]) -> bool:
+        """특정 수신자들에게 이메일 전송"""
+        try:
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = self.email_config['sender_email']
+            msg['To'] = ', '.join(recipients)
+            
+            html_part = MIMEText(html_content, 'html', 'utf-8')
+            msg.attach(html_part)
+            
+            with smtplib.SMTP(self.email_config['smtp_server'], self.email_config['smtp_port']) as server:
+                server.starttls()
+                server.login(self.email_config['sender_email'], self.email_config['sender_password'])
+                server.send_message(msg)
+                
+            logger.info(f"📧 이메일 전송 성공: {', '.join(recipients)}")
             return True
             
         except Exception as e:
@@ -1533,9 +1728,8 @@ def main():
             schedule.every().day.at("07:00").do(monitor.run_daily_monitoring)
             schedule.every(3).hours.do(monitor.run_company_monitoring, company_cache)
             
-            # 시작 시 즉시 한 번 실행 (선택적)
+            # 시작 시 즉시 한 번 실행 (회사 모니터링만)
             logger.info("🚀 초기 실행 시작...")
-            monitor.run_daily_monitoring()
             monitor.run_company_monitoring(company_cache)
             
             # 스케줄 루프 실행
