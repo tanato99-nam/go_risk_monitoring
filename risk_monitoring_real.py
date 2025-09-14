@@ -1614,7 +1614,7 @@ class AIRiskMonitoringSystem:
             logger.error(f"이메일 전송 실패: {e}")
             return False
 
-    def run(self):
+    def run(self, test_mode=False):
         """메인 실행 함수"""
         logger.info("\n" + "="*70)
         logger.info("🚀 AI 기반 글로벌 리스크 모니터링 시작")
@@ -1655,7 +1655,14 @@ class AIRiskMonitoringSystem:
                 f.write(html_content)
             
             # 8. 이메일 전송
-            if self.email_config['sender_email'] and self.email_config['recipients']:
+            if test_mode and self.email_config.get('admin_email'):
+                # 테스트 모드: 관리자에게만 전송
+                logger.info("\n📧 테스트 모드 - 관리자에게만 이메일 전송...")
+                recipients = [self.email_config['admin_email']]
+                email_sent = self.send_email_to_recipients(html_content, 
+                                                        f"[테스트] {subject}", 
+                                                        recipients)
+            elif self.email_config['sender_email'] and self.email_config['recipients']:
                 logger.info("\n📧 이메일 전송 시작...")
                 email_sent = self.send_email_report(html_content, final_news)
                 if email_sent:
@@ -1696,7 +1703,7 @@ def main():
         
         if args.mode == 'test':
             logger.info("\n🧪 테스트 모드 - 전체 모니터링 1회 실행")
-            result = monitor.run()
+            result = monitor.run(test_mode=True)
             
             # 테스트 모드에서도 명시적으로 이메일 전송 확인
             if result['success']:
