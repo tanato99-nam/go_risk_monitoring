@@ -1658,10 +1658,26 @@ class AIRiskMonitoringSystem:
             if test_mode and self.email_config.get('admin_email'):
                 # 테스트 모드: 관리자에게만 전송
                 logger.info("\n📧 테스트 모드 - 관리자에게만 이메일 전송...")
+                
+                # subject 변수 정의 (누락된 부분)
+                high_risk_count = len([n for n in final_news if n.risk_level == 'HIGH'])
+                if high_risk_count > 0:
+                    subject = f"[테스트] 리스크 모니터링 - ⚠️ HIGH RISK {high_risk_count}건 - {datetime.now().strftime('%Y-%m-%d')}"
+                else:
+                    subject = f"[테스트] 리스크 모니터링 - 정상 모니터링 완료 - {datetime.now().strftime('%Y-%m-%d')}"
+                
                 recipients = [self.email_config['admin_email']]
-                email_sent = self.send_email_to_recipients(html_content, 
-                                                        f"[테스트] {subject}", 
-                                                        recipients)
+                email_sent = self.send_email_to_recipients(
+                    html_content, 
+                    subject,  # 이제 정의됨
+                    recipients
+                )
+            
+                if email_sent:
+                    logger.info("✅ 테스트 이메일 전송 완료 (관리자)")
+                else:
+                    logger.error("❌ 테스트 이메일 전송 실패")
+                    
             elif self.email_config['sender_email'] and self.email_config['recipients']:
                 logger.info("\n📧 이메일 전송 시작...")
                 email_sent = self.send_email_report(html_content, final_news)
@@ -1669,6 +1685,9 @@ class AIRiskMonitoringSystem:
                     logger.info("✅ 이메일 전송 완료")
                 else:
                     logger.error("❌ 이메일 전송 실패")
+            else:
+                logger.warning("⚠️ 이메일 설정이 없어 전송하지 않았습니다.")
+                email_sent = False
             
             # 9. 결과 출력
             self._print_detailed_stats()
