@@ -111,6 +111,7 @@ class NewsItem:
     is_duplicate: bool = False
     duplicate_of: str = ""
     ai_analysis_timestamp: str = ""
+    is_company_news: bool = False  # 회사 관련 뉴스 여부
     
     def __post_init__(self):
         """뉴스 해시 생성"""
@@ -133,7 +134,54 @@ class GeminiAnalyzer:
             'MEDIUM': 40,
             'LOW': 20
         }
-    
+
+    def evaluate_company_news_relevance(self, news_item: NewsItem, keyword: str) -> Tuple[bool, str]:
+        """AI 기반 회사 뉴스 관련성 평가"""
+        try:
+            prompt = f"""You are evaluating if this news article is relevant for Samsung C&T's construction business risk monitoring.
+
+News Details:
+Title: {news_item.title}
+Content: {news_item.snippet}
+Source: {news_item.source}
+Date: {news_item.date}
+Search Keyword Used: {keyword}
+
+Evaluation Criteria:
+1. MUST be about Samsung C&T's construction/engineering business (not Samsung Electronics or other affiliates)
+2. MUST NOT be from Korean media if it's just translating/republishing Korean news
+3. MUST NOT be from Samsung's official PR channels or newsrooms
+4. MUST be relevant to construction industry (projects, safety, contracts, infrastructure, mou)
+5. Should focus on: accidents, project delays, legal issues, business deals, safety incidents, labor disputes
+
+Response Format:
+Relevant: (Yes/No)
+Reason: (One sentence explanation)
+Confidence: (High/Medium/Low)"""
+
+            response = self.model.generate_content(prompt)
+            result = response.text.strip().lower()
+            
+            # Parse response
+            is_relevant = 'relevant: yes' in result
+            
+            # Extract reason for logging
+            reason = "AI evaluation"
+            if 'reason:' in result:
+                reason_start = result.index('reason:') + 7
+                reason_end = result.find('\n', reason_start)
+                if reason_end == -1:
+                    reason = result[reason_start:].strip()
+                else:
+                    reason = result[reason_start:reason_end].strip()
+            
+            return is_relevant, reason
+            
+        except Exception as e:
+            logger.error(f"AI relevance check error: {e}")
+            # Fallback to include if AI fails
+            return True, "AI evaluation failed - including by default"
+
     def remove_duplicates(self, news_list: List[NewsItem]) -> List[NewsItem]:
         """AI 기반 중복 뉴스 제거"""
         logger.info("🔍 AI 기반 중복 뉴스 제거 시작...")
@@ -239,63 +287,56 @@ Reason: (Brief explanation)"""
         except Exception as e:
             logger.error(f"AI duplicate check error: {e}")
             return False, None
-    
+
     def analyze_risk_batch(self, news_list: List[NewsItem], batch_size: int = 5) -> List[NewsItem]:
-        """배치 단위로 리스크 분석"""
+        """배치 단위로 리스크 분석 - 회사 뉴스도 동일하게 평가"""
         logger.info(f"🤖 AI 리스크 분석 시작 ({len(news_list)}건)...")
         
         filtered_list = news_list
         analyzed_news = []
         
-        # 배치 처리
+        # 배치 처리 - 회사/일반 구분 없이 모두 AI 분석
         for i in range(0, len(filtered_list), batch_size):
             batch = filtered_list[i:i+batch_size]
             
-            # 회사 뉴스는 AI 분석 없이 바로 COMPANY로 분류
-            company_batch = []
-            regular_batch = []
+            # 모든 뉴스에 대해 AI 분석 수행
+            prompt = self._create_risk_analysis_prompt(batch)
             
-            for news in batch:
-                if news.country_code in ["samsung", "global_samsung"]:
-                    news.risk_level = 'COMPANY'
-                    news.risk_score = 0
-                    news.risk_category = 'Company News'
-                    news.ai_analysis_timestamp = datetime.now().isoformat()
-                    company_batch.append(news)
-                else:
-                    regular_batch.append(news)
-            
-            # 일반 뉴스만 AI 분석
-            if regular_batch:
-                prompt = self._create_risk_analysis_prompt(regular_batch)
+            try:
+                response = self.model.generate_content(prompt)
+                results = self._parse_risk_response(response.text, batch)
                 
-                try:
-                    response = self.model.generate_content(prompt)
-                    results = self._parse_risk_response(response.text, regular_batch)
-                    analyzed_news.extend(results)
-                    
-                    time.sleep(1)
-                    logger.info(f"  - 분석 진행: {min(i+batch_size, len(filtered_list))}/{len(filtered_list)}")
-                    
-                except Exception as e:
-                    logger.error(f"❌ AI 분석 오류: {e}")
-                    for news in regular_batch:
-                        news.risk_score = 0
-                        news.risk_level = ""
-                    analyzed_news.extend(regular_batch)
-            
-            # 회사 뉴스 추가
-            analyzed_news.extend(company_batch)
+                # 회사 관련 뉴스에 추가 가중치
+                for news in results:
+                    if news.country_code in ["samsung", "global_samsung"]:
+                        # 회사 뉴스 표시 (추가 필드)
+                        news.is_company_news = True
+                        
+                        # 리스크 점수 가중치 추가
+                        news.risk_score = min(100, news.risk_score + 20)
+                        
+                        # 리스크 레벨 재계산
+                        if news.risk_score >= self.risk_thresholds['HIGH']:
+                            news.risk_level = 'HIGH'
+                        elif news.risk_score >= self.risk_thresholds['MEDIUM']:
+                            news.risk_level = 'MEDIUM'
+                        else:
+                            news.risk_level = 'LOW'
+                        
+                        logger.info(f"  회사 뉴스: {news.title[:50]}... -> {news.risk_level} ({news.risk_score:.0f}점)")
+                
+                analyzed_news.extend(results)
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"❌ AI 분석 오류: {e}")
+                for news in batch:
+                    news.risk_score = 0
+                    news.risk_level = "LOW"
+                analyzed_news.extend(batch)
         
-        # 리스크 점수 기준으로 필터링
-        filtered_news = []
-        for n in analyzed_news:
-            # 회사 뉴스는 무조건 포함
-            if n.risk_level == 'COMPANY':
-                filtered_news.append(n)
-            # 일반 뉴스는 LOW(20점) 이상만 포함
-            elif n.risk_score >= self.risk_thresholds['LOW']:
-                filtered_news.append(n)
+        # 리스크 점수 기준으로 필터링 (LOW 20점 이상만)
+        filtered_news = [n for n in analyzed_news if n.risk_score >= self.risk_thresholds['LOW']]
         
         logger.info(f"✅ AI 분석 완료: {len(filtered_news)}건 처리")
         return filtered_news
@@ -1274,36 +1315,52 @@ class AIRiskMonitoringSystem:
             low_risk = [n for n in final_news if n.risk_level == 'LOW']
             company_level = [n for n in final_news if n.risk_level == 'COMPANY']
             
-            # 1. 일반 수신자: HIGH 또는 MEDIUM이 있는 경우만 전송
-            if (high_risk or medium_risk) and self.email_config['recipients']:
-                # HIGH와 MEDIUM만 포함한 리포트 생성
-                urgent_news = high_risk + medium_risk
-                html_content = self.create_urgent_company_report(urgent_news, report_type='urgent')
+            # 1. 일반 수신자: HIGH만 긴급 알림 (수정된 부분)
+            if high_risk and self.email_config['recipients']:
+                html_content = self.create_urgent_company_report(high_risk, report_type='urgent')
                 
-                risk_text = []
-                if high_risk:
-                    risk_text.append(f"HIGH {len(high_risk)}건")
-                if medium_risk:
-                    risk_text.append(f"MEDIUM {len(medium_risk)}건")
-                
-                subject = f"[긴급] 삼성물산 관련 뉴스 - {' / '.join(risk_text)} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                subject = f"[긴급] 삼성물산 관련 HIGH RISK {len(high_risk)}건 발생 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
                 
                 # 일반 수신자에게 전송
                 self.send_email_to_recipients(html_content, subject, self.email_config['recipients'])
-                logger.info(f"📧 긴급 알림 이메일 전송 완료 (일반 수신자: {len(urgent_news)}건)")
+                logger.info(f"📧 긴급 알림 이메일 전송 완료 (HIGH RISK {len(high_risk)}건)")
+            elif high_risk:
+                logger.info(f"⚠️ HIGH RISK {len(high_risk)}건 발견, 이메일 수신자 미설정")
+            else:
+                logger.info(f"ℹ️ HIGH RISK 없음 (MEDIUM: {len(medium_risk)}건, LOW: {len(low_risk)}건)")
             
-            # 2. 관리자: 모든 뉴스 전송 (항상)
+            # 2. 관리자: 모든 뉴스 전송 (HIGH, MEDIUM, LOW 포함)
             if final_news and self.email_config.get('admin_email'):
                 html_content_admin = self.create_urgent_company_report(final_news, report_type='admin')
                 
-                subject_admin = f"[관리자] 삼성물산 모니터링 - 전체 {len(final_news)}건 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                # 리스크 레벨별 카운트 표시
+                risk_summary = []
+                if high_risk:
+                    risk_summary.append(f"HIGH {len(high_risk)}건")
+                if medium_risk:
+                    risk_summary.append(f"MEDIUM {len(medium_risk)}건")
+                if low_risk:
+                    risk_summary.append(f"LOW {len(low_risk)}건")
+                if company_level:
+                    risk_summary.append(f"COMPANY {len(company_level)}건")
+                
+                subject_admin = f"[관리자] 삼성물산 모니터링 - {' / '.join(risk_summary) if risk_summary else '새 뉴스 없음'} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
                 
                 # 관리자에게 전송
                 self.send_email_to_recipients(html_content_admin, subject_admin, [self.email_config['admin_email']])
-                logger.info(f"📧 관리자 전체 리포트 전송 완료 ({len(final_news)}건)")
+                logger.info(f"📧 관리자 전체 리포트 전송 완료 (전체 {len(final_news)}건)")
             
             # 캐시 저장
             company_cache.save_cache()
+            
+            # 통계 로그
+            logger.info("\n📊 모니터링 결과:")
+            logger.info(f"  - HIGH RISK: {len(high_risk)}건 {'(긴급알림 발송)' if high_risk else ''}")
+            logger.info(f"  - MEDIUM RISK: {len(medium_risk)}건")
+            logger.info(f"  - LOW RISK: {len(low_risk)}건")
+            if company_level:
+                logger.info(f"  - COMPANY: {len(company_level)}건")
+            
             logger.info("✅ 회사 모니터링 완료")
             return True
             
@@ -1312,28 +1369,16 @@ class AIRiskMonitoringSystem:
             return False
 
     def collect_company_news_only(self) -> List[NewsItem]:
-        """회사 관련 뉴스만 수집 (3시간 주기용)"""
+        """회사 관련 뉴스만 수집 (AI 기반 필터링)"""
         all_news = []
         
-        # 제외할 소스들
-        korean_sources = ['yonhap', '연합', 'korea', 'chosun', '조선', 
-                        'joongang', '중앙', 'hankyoreh', '한겨레', 'donga', '동아',
-                        'hankook', '한국', 'maeil', '매일', 'seoul', '서울']
-        
-        official_sources = ['samsung newsroom', '삼성 뉴스룸', 'samsung.com', 
-                        'samsungcnt.com', 'samsung c&t newsroom']
-        
-        construction_keywords = ['construction', 'building', 'infrastructure', 'engineering',
-                            'project', 'development', 'contractor', 'architecture',
-                            '건설', '건축', '공사', '시공', '프로젝트', '개발']
-        
-        logger.info("\n🏢 회사 키워드 뉴스 수집 시작 (해외만)")
+        logger.info("\n🏢 회사 키워드 뉴스 수집 시작 (AI 필터링)")
         
         for idx, keyword in enumerate(self.company_keywords, 1):
             logger.info(f"[{idx}/{len(self.company_keywords)}] {keyword}")
             
-            # 건설업 관련 검색어
-            query = f'"{keyword}" (construction OR building OR project OR infrastructure) -site:kr -korea -한국 -newsroom'
+            # 더 넓은 범위로 초기 검색 (필터링은 AI가 처리)
+            query = f'"{keyword}"'
             
             try:
                 params = {
@@ -1341,70 +1386,81 @@ class AIRiskMonitoringSystem:
                     "engine": "google_news",
                     "q": query,
                     "when": "7d",
-                    "gl": "us",
+                    "gl": "us",  # 글로벌 관점
                     "hl": "en"
                 }
                 
                 search = self.GoogleSearch(params)
                 response = search.get_dict()
+                self.stats['api_calls'] += 1
                 
                 if "news_results" in response:
-                    for item in response["news_results"][:30]:
-                        # 날짜 체크
-                        if not self._is_within_days(item.get('date', ''), 7):
+                    company_news = []
+                    ai_evaluated = 0
+                    ai_accepted = 0
+                    
+                    for item in response["news_results"][:20]:  # 더 많이 가져와서 AI 필터링
+                        # 날짜 체크 (기존 로직 유지)
+                        date_str = item.get('date', '')
+                        if not self._is_within_days(date_str, 7):
                             continue
                         
-                        source = item.get('source', {}).get('name', '').lower()
-                        
-                        # 필터링
-                        if any(ks in source for ks in korean_sources):
-                            continue
-                        
-                        if any(os in source for os in official_sources):
-                            continue
-                        
-                        # 건설업 관련성 체크
-                        title = item.get('title', '').lower()
-                        snippet = item.get('snippet', '').lower()
-                        
-                        has_construction_relevance = any(
-                            ck.lower() in title or ck.lower() in snippet 
-                            for ck in construction_keywords
-                        )
-                        
-                        if not has_construction_relevance:
-                            continue
-                        
+                        # NewsItem 생성
                         news_item = NewsItem(
                             title=item.get('title', ''),
-                            date=item.get('date', ''),
+                            date=date_str,
                             source=item.get('source', {}).get('name', 'Unknown'),
                             snippet=item.get('snippet', ''),
                             link=item.get('link', ''),
                             country="Global",
                             country_ko="해외",
                             country_code="global_samsung",
+                            thumbnail=item.get('thumbnail', ''),
                             search_type='company_global',
                             collected_at=datetime.now().isoformat()
                         )
-                        all_news.append(news_item)
                         
-                        if len(all_news) >= 10:  # 최대 10건
+                        # AI 기반 관련성 평가
+                        ai_evaluated += 1
+                        is_relevant, reason = self.analyzer.evaluate_company_news_relevance(
+                            news_item, keyword
+                        )
+                        
+                        if is_relevant:
+                            company_news.append(news_item)
+                            ai_accepted += 1
+                            logger.debug(f"  ✓ AI 승인: {news_item.title[:50]}...")
+                        else:
+                            logger.debug(f"  ✗ AI 제외: {news_item.title[:50]}... ({reason[:50]})")
+                        
+                        # 최대 15건만 수집 (AI 필터링 후)
+                        if len(company_news) >= 15:
                             break
+                        
+                        # API 과부하 방지
+                        if ai_evaluated % 10 == 0:
+                            time.sleep(0.5)
+                    
+                    logger.info(f"  - {keyword}: AI 평가 {ai_evaluated}건 → 승인 {ai_accepted}건 → 최종 {len(company_news)}건")
+                    all_news.extend(company_news)
+                    self.stats['news_collected'] += len(company_news)
                     
             except Exception as e:
-                logger.error(f"회사 키워드 검색 오류: {e}")
+                logger.error(f"회사 키워드 검색 오류 ({keyword}): {e}")
+                self.stats['errors'] += 1
             
             time.sleep(1)
         
-        # 2. 한국 미디어에서 회사 검색
-        logger.info("\n🇰🇷 한국 언론 내 회사 뉴스 모니터링")
+        # 한국 미디어 검색도 AI 기반으로 전환
+        logger.info("\n🇰🇷 한국 언론 내 회사 뉴스 모니터링 (AI 필터링)")
         for site in self.korean_media.get('sites', []):
             if not site.get('active', False):
                 continue
             
             for term in self.korean_media.get('search_terms', []):
                 query = f'{site["selector"]} "{term}"'
+                logger.info(f"  - {site['name']}: {term}")
+                
                 news = self.search_news(
                     query=query,
                     country_code='kr',
@@ -1412,16 +1468,25 @@ class AIRiskMonitoringSystem:
                     search_type='web'
                 )
                 
-                # 회사 관련 뉴스 표시
+                # AI 기반 필터링
+                filtered_news = []
                 for item in news:
-                    item.country = "Samsung C&T"
-                    item.country_ko = "삼성물산"
-                    item.country_code = "samsung"
+                    is_relevant, reason = self.analyzer.evaluate_company_news_relevance(
+                        item, term
+                    )
+                    
+                    if is_relevant:
+                        item.country = "Samsung C&T"
+                        item.country_ko = "삼성물산"
+                        item.country_code = "samsung"
+                        filtered_news.append(item)
+                        logger.debug(f"  ✓ 한국 뉴스 포함: {item.title[:30]}...")
                 
-                all_news.extend(news)
+                logger.info(f"    → {len(news)}건 중 {len(filtered_news)}건 선택")
+                all_news.extend(filtered_news)
                 time.sleep(1)
         
-        logger.info(f"\n✅ 회사 관련 뉴스 {len(all_news)}건 수집 완료")
+        logger.info(f"\n✅ 회사 관련 뉴스 {len(all_news)}건 수집 완료 (AI 필터링)")
         return all_news
 
     def create_urgent_company_report(self, news_list: List[NewsItem], report_type: str = 'urgent') -> str:
