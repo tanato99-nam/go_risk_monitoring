@@ -342,42 +342,63 @@ Reason: (Brief explanation)"""
         return filtered_news
     
     def _create_risk_analysis_prompt(self, news_batch: List[NewsItem]) -> str:
-        """리스크 분석 프롬프트 생성"""
-        prompt = """You are a risk analysis expert for a global construction company.
-Please analyze the following news articles and evaluate the risk score for each.
+        """리스크 분석 프롬프트 생성 - 위험과 기회 모두 평가"""
+        prompt = """You are a risk and opportunity analysis expert for a global construction company.
+    Please analyze the following news articles and evaluate the importance score for each.
 
-EVALUATION CRITERIA:
-1. Business Impact (0-40 points)
-   - Project disruption/delay possibility
-   - Financial loss magnitude
-   - Legal/regulatory risks
-   
-2. Reputation Impact (0-30 points)
-   - Negative media coverage potential
-   - Brand image damage level
-   - Stakeholder trust impact
-   
-3. Employee Safety/Harm (0-30 points)
-   - Employee life/safety threats
-   - Work environment deterioration
-   - Evacuation/withdrawal necessity
+    EVALUATION CRITERIA FOR NEGATIVE EVENTS (Risks):
+    1. Business Impact (0-40 points)
+    - Project disruption/delay possibility
+    - Financial loss magnitude
+    - Legal/regulatory risks
+    
+    2. Reputation Impact (0-30 points)
+    - Negative media coverage potential
+    - Brand image damage level
+    - Stakeholder trust impact
+    
+    3. Employee Safety/Harm (0-30 points)
+    - Employee life/safety threats
+    - Work environment deterioration
+    - Evacuation/withdrawal necessity
 
-SPECIAL WEIGHTS:
-- Direct mention of Samsung C&T or Samsung Construction: +20 points
-- Accidents with 10+ fatalities: +30 points
-- National-scale disasters/calamities: +25 points
-- Large-scale protests/political instability: +20 points
+    EVALUATION CRITERIA FOR POSITIVE EVENTS (Opportunities):
+    1. Business Value (0-40 points)
+    - Major contract/project wins
+    - Revenue generation potential
+    - Market expansion opportunities
+    
+    2. Strategic Impact (0-30 points)
+    - Competitive advantage gains
+    - Partnership/alliance benefits
+    - Innovation/technology advancement
+    
+    3. Brand Enhancement (0-30 points)
+    - Positive media coverage
+    - Industry recognition/awards
+    - ESG/sustainability achievements
 
-Note: If news source is from Samsung official channels, deduct points appropriately.
+    SPECIAL WEIGHTS:
+    - Direct mention of Samsung C&T or Samsung Construction: +20 points
+    - For Risks: Accidents with 10+ fatalities: +30 points
+    - For Risks: National-scale disasters/calamities: +25 points
+    - For Risks: Large-scale protests/political instability: +20 points
+    - For Opportunities: Contracts over $1 billion: +30 points
+    - For Opportunities: Entry into new markets/countries: +25 points
+    - For Opportunities: Major awards or #1 rankings: +20 points
 
-For each news item, respond in the following format:
-[News Number]
-RiskScore: (0-100)
-RiskCategory: (Natural Disaster/Political Unrest/Accident/Health Crisis/Economic Crisis/Other)
-KeyRisk: (One sentence summary)
+    Note: If news source is from Samsung official channels, adjust points appropriately (reduce for risks, moderate increase for opportunities).
 
-NEWS LIST:
-"""
+    For each news item, respond in the following format:
+    [News Number]
+    EventType: (Risk/Opportunity)
+    RiskScore: (0-100, use 0 if Opportunity)
+    OpportunityScore: (0-100, use 0 if Risk)
+    RiskCategory: (Natural Disaster/Political Unrest/Accident/Health Crisis/Economic Crisis/Major Contract/Market Expansion/Business Achievement/Other)
+    KeyPoint: (One sentence summary of the risk or opportunity)
+
+    NEWS LIST:
+    """
         
         for idx, news in enumerate(news_batch):
             prompt += f"\n[{idx+1}]\n"
@@ -390,7 +411,7 @@ NEWS LIST:
         return prompt
     
     def _parse_risk_response(self, response_text: str, news_batch: List[NewsItem]) -> List[NewsItem]:
-        """AI 응답 파싱"""
+        """AI 응답 파싱 - 위험과 기회 모두 처리"""
         results = []
         sections = response_text.split('[')
         
@@ -403,27 +424,61 @@ NEWS LIST:
                     continue
                 
                 news = news_batch[news_idx]
+                event_type = ""
+                opportunity_score = 0
                 
                 for line in lines[1:]:
                     line_lower = line.lower()
-                    if 'riskscore:' in line_lower:
+                    
+                    # Event Type 파싱
+                    if 'eventtype:' in line_lower:
+                        if 'opportunity' in line_lower:
+                            event_type = 'opportunity'
+                        else:
+                            event_type = 'risk'
+                    
+                    # Risk Score 파싱 (기존 로직)
+                    elif 'riskscore:' in line_lower:
                         score_match = re.findall(r'\d+', line)
                         if score_match:
-                            score = float(score_match[0])
-                            news.risk_score = score
+                            news.risk_score = float(score_match[0])
+                    
+                    # Opportunity Score 파싱 (신규)
+                    elif 'opportunityscore:' in line_lower:
+                        score_match = re.findall(r'\d+', line)
+                        if score_match:
+                            opportunity_score = float(score_match[0])
+                    
+                    # Category 파싱
                     elif 'riskcategory:' in line_lower:
                         parts = line.split(':', 1)
                         if len(parts) > 1:
-                            category = parts[1].strip()
-                            news.risk_category = category
+                            news.risk_category = parts[1].strip()
                 
                 # 리스크 레벨 설정
-                if news.risk_score >= self.risk_thresholds['HIGH']:
-                    news.risk_level = 'HIGH'
-                elif news.risk_score >= self.risk_thresholds['MEDIUM']:
-                    news.risk_level = 'MEDIUM'
+                if event_type == 'opportunity' and opportunity_score > 0:
+                    # 기회는 risk_score에 opportunity_score를 저장 (통일된 처리를 위해)
+                    news.risk_score = opportunity_score
+                    
+                    # 중요한 기회는 HIGH로 분류하여 긴급알림 대상이 되도록
+                    if opportunity_score >= 70:
+                        news.risk_level = 'HIGH'
+                        news.risk_category = f"OPPORTUNITY: {news.risk_category}"
+                    elif opportunity_score >= 40:
+                        news.risk_level = 'MEDIUM'
+                        news.risk_category = f"OPPORTUNITY: {news.risk_category}"
+                    else:
+                        news.risk_level = 'LOW'
                 else:
-                    news.risk_level = 'LOW'
+                    # 기존 리스크 레벨 로직
+                    if news.risk_score >= self.risk_thresholds['HIGH']:
+                        news.risk_level = 'HIGH'
+                        news.risk_category = f"RISK: {news.risk_category}"
+                    elif news.risk_score >= self.risk_thresholds['MEDIUM']:
+                        news.risk_level = 'MEDIUM'
+                        news.risk_category = f"RISK: {news.risk_category}"
+                    else:
+                        news.risk_level = 'LOW'
                 
                 news.ai_analysis_timestamp = datetime.now().isoformat()
                 results.append(news)
@@ -1315,19 +1370,25 @@ class AIRiskMonitoringSystem:
             low_risk = [n for n in final_news if n.risk_level == 'LOW']
             company_level = [n for n in final_news if n.risk_level == 'COMPANY']
             
-            # 1. 일반 수신자: HIGH만 긴급 알림 (수정된 부분)
+            # 1. 일반 수신자: HIGH RISK 또는 HIGH OPPORTUNITY 긴급 알림
             if high_risk and self.email_config['recipients']:
+                # 리스크와 기회 구분
+                high_risks = [n for n in high_risk if 'RISK:' in n.risk_category]
+                high_opportunities = [n for n in high_risk if 'OPPORTUNITY:' in n.risk_category]
+                
+                # 제목 생성
+                subject_parts = []
+                if high_risks:
+                    subject_parts.append(f"위험 {len(high_risks)}건")
+                if high_opportunities:
+                    subject_parts.append(f"기회 {len(high_opportunities)}건")
+                
+                subject = f"[긴급] 삼성물산 - {' / '.join(subject_parts)} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                
                 html_content = self.create_urgent_company_report(high_risk, report_type='urgent')
-                
-                subject = f"[긴급] 삼성물산 관련 HIGH RISK {len(high_risk)}건 발생 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-                
-                # 일반 수신자에게 전송
                 self.send_email_to_recipients(html_content, subject, self.email_config['recipients'])
-                logger.info(f"📧 긴급 알림 이메일 전송 완료 (HIGH RISK {len(high_risk)}건)")
-            elif high_risk:
-                logger.info(f"⚠️ HIGH RISK {len(high_risk)}건 발견, 이메일 수신자 미설정")
-            else:
-                logger.info(f"ℹ️ HIGH RISK 없음 (MEDIUM: {len(medium_risk)}건, LOW: {len(low_risk)}건)")
+                
+                logger.info(f"📧 긴급 알림 발송 (위험: {len(high_risks)}건, 기회: {len(high_opportunities)}건)")
             
             # 2. 관리자: 모든 뉴스 전송 (HIGH, MEDIUM, LOW 포함)
             if final_news and self.email_config.get('admin_email'):
