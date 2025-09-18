@@ -130,9 +130,9 @@ class GeminiAnalyzer:
         
         # 리스크 점수 기준
         self.risk_thresholds = {
-            'HIGH': 70,
-            'MEDIUM': 40,
-            'LOW': 20
+            'HIGH': 80,
+            'MEDIUM': 60,
+            'LOW': 40
         }
 
     def evaluate_company_news_relevance(self, news_item: NewsItem, keyword: str) -> Tuple[bool, str]:
@@ -289,113 +289,164 @@ Reason: (Brief explanation)"""
             return False, None
 
     def analyze_risk_batch(self, news_list: List[NewsItem], batch_size: int = 5) -> List[NewsItem]:
-        """배치 단위로 리스크 분석 - 회사 뉴스도 동일하게 평가"""
+        """배치 단위로 리스크 분석 - 조정된 임계값 적용"""
         logger.info(f"🤖 AI 리스크 분석 시작 ({len(news_list)}건)...")
         
         filtered_list = news_list
         analyzed_news = []
         
-        # 배치 처리 - 회사/일반 구분 없이 모두 AI 분석
+        # 배치 처리
         for i in range(0, len(filtered_list), batch_size):
             batch = filtered_list[i:i+batch_size]
-            
-            # 모든 뉴스에 대해 AI 분석 수행
             prompt = self._create_risk_analysis_prompt(batch)
             
             try:
                 response = self.model.generate_content(prompt)
                 results = self._parse_risk_response(response.text, batch)
                 
-                # 회사 관련 뉴스에 추가 가중치
+                # 회사 관련 뉴스 가중치
                 for news in results:
                     if news.country_code in ["samsung", "global_samsung"]:
-                        # 회사 뉴스 표시 (추가 필드)
                         news.is_company_news = True
+                        # 가중치 10점 추가
+                        news.risk_score = min(100, news.risk_score + 10)
                         
-                        # 리스크 점수 가중치 추가
-                        news.risk_score = min(100, news.risk_score + 20)
-                        
-                        # 리스크 레벨 재계산
-                        if news.risk_score >= self.risk_thresholds['HIGH']:
+                        # 리스크 레벨 재계산 (조정된 임계값 적용)
+                        if news.risk_score >= self.risk_thresholds['HIGH']:  # 80 이상
                             news.risk_level = 'HIGH'
-                        elif news.risk_score >= self.risk_thresholds['MEDIUM']:
+                        elif news.risk_score >= self.risk_thresholds['MEDIUM']:  # 60 이상
                             news.risk_level = 'MEDIUM'
-                        else:
+                        elif news.risk_score >= self.risk_thresholds['LOW']:  # 40 이상
                             news.risk_level = 'LOW'
+                        else:
+                            news.risk_level = 'VERY_LOW'  # 40 미만
                         
-                        logger.info(f"  회사 뉴스: {news.title[:50]}... -> {news.risk_level} ({news.risk_score:.0f}점)")
+                        logger.debug(f"  회사 뉴스: {news.title[:50]}... -> {news.risk_level} ({news.risk_score:.0f}점)")
                 
                 analyzed_news.extend(results)
                 time.sleep(1)
+                logger.info(f"  - 분석 진행: {min(i+batch_size, len(filtered_list))}/{len(filtered_list)}")
                 
             except Exception as e:
                 logger.error(f"❌ AI 분석 오류: {e}")
                 for news in batch:
                     news.risk_score = 0
-                    news.risk_level = "LOW"
+                    news.risk_level = "VERY_LOW"
                 analyzed_news.extend(batch)
         
-        # 리스크 점수 기준으로 필터링 (LOW 20점 이상만)
-        filtered_news = [n for n in analyzed_news if n.risk_score >= self.risk_thresholds['LOW']]
+        # 점수 분포 통계 (디버깅용)
+        score_distribution = {
+            '0-40 (제외)': 0,
+            '40-60 (LOW)': 0,
+            '60-80 (MEDIUM)': 0,
+            '80-100 (HIGH)': 0
+        }
         
-        logger.info(f"✅ AI 분석 완료: {len(filtered_news)}건 처리")
+        for n in analyzed_news:
+            if n.risk_score < 40:
+                score_distribution['0-40 (제외)'] += 1
+            elif n.risk_score < 60:
+                score_distribution['40-60 (LOW)'] += 1
+            elif n.risk_score < 80:
+                score_distribution['60-80 (MEDIUM)'] += 1
+            else:
+                score_distribution['80-100 (HIGH)'] += 1
+        
+        logger.info(f"📊 AI 평가 점수 분포:")
+        for range_key, count in score_distribution.items():
+            logger.info(f"  {range_key}: {count}건")
+        
+        # 필터링: LOW(40점) 이상만 포함
+        filtered_news = []
+        for n in analyzed_news:
+            if 'OPPORTUNITY:' in n.risk_category:
+                # 기회는 60점 이상만 (중요한 기회만)
+                if n.risk_score >= 60:
+                    filtered_news.append(n)
+            else:
+                # 리스크는 40점 이상만 포함
+                if n.risk_score >= self.risk_thresholds['LOW']:  # 40점
+                    filtered_news.append(n)
+        
+        # 필터링 결과 로깅
+        logger.info(f"📊 필터링 결과:")
+        logger.info(f"  - 분석 전체: {len(analyzed_news)}건")
+        logger.info(f"  - 필터링 후: {len(filtered_news)}건 (포함률: {(len(filtered_news)/max(len(analyzed_news), 1)*100):.1f}%)")
+        logger.info(f"  - HIGH (80+): {sum(1 for n in filtered_news if n.risk_level == 'HIGH')}건")
+        logger.info(f"  - MEDIUM (60-79): {sum(1 for n in filtered_news if n.risk_level == 'MEDIUM')}건")
+        logger.info(f"  - LOW (40-59): {sum(1 for n in filtered_news if n.risk_level == 'LOW')}건")
+        
         return filtered_news
     
     def _create_risk_analysis_prompt(self, news_batch: List[NewsItem]) -> str:
-        """리스크 분석 프롬프트 생성 - 위험과 기회 모두 평가"""
+        """리스크 분석 프롬프트 생성 - 엄격한 기준 적용"""
         prompt = """You are a risk and opportunity analysis expert for a global construction company.
-    Please analyze the following news articles and evaluate the importance score for each.
+    Please analyze the following news articles with BALANCED CRITERIA.
+
+    SCORING GUIDELINES:
+    - Use the full 0-100 range appropriately
+    - Most routine news should score 20-40 (LOW but worth monitoring)
+    - Significant events should score 40-70 (MEDIUM attention needed)  
+    - Only truly critical events should score 70+ (HIGH immediate action)
+    - Don't be overly conservative - if it's newsworthy for the company, give it at least 20 points
 
     EVALUATION CRITERIA FOR NEGATIVE EVENTS (Risks):
-    1. Business Impact (0-40 points)
-    - Project disruption/delay possibility
-    - Financial loss magnitude
-    - Legal/regulatory risks
+    1. Business Impact (0-40 points) - ONLY assign points if:
+    - CONFIRMED project cancellation or major delay (>6 months): 30-40 points
+    - VERIFIED financial loss over $10 million: 25-35 points
+    - ACTIVE legal proceedings with potential >$5M liability: 20-30 points
+    - Minor delays or speculative impacts: 0-10 points only
     
-    2. Reputation Impact (0-30 points)
-    - Negative media coverage potential
-    - Brand image damage level
-    - Stakeholder trust impact
+    2. Reputation Impact (0-30 points) - ONLY assign points if:
+    - International media coverage with company name in headline: 20-30 points
+    - Major scandal with evidence of wrongdoing: 15-25 points
+    - Regional/local coverage only: 0-10 points
+    - Routine business disputes: 0-5 points
     
-    3. Employee Safety/Harm (0-30 points)
-    - Employee life/safety threats
-    - Work environment deterioration
-    - Evacuation/withdrawal necessity
+    3. Employee Safety/Harm (0-30 points) - ONLY assign points if:
+    - Confirmed fatalities at company sites: 25-30 points
+    - Multiple serious injuries (hospitalization required): 15-25 points
+    - Minor injuries or potential threats: 0-10 points
+    - General area risks without direct impact: 0-5 points
 
     EVALUATION CRITERIA FOR POSITIVE EVENTS (Opportunities):
-    1. Business Value (0-40 points)
-    - Major contract/project wins
-    - Revenue generation potential
-    - Market expansion opportunities
+    1. Business Value (0-40 points) - ONLY assign points if:
+    - Confirmed contract over $1 billion: 35-40 points
+    - Confirmed contract $500M-$1B: 25-35 points
+    - Strategic partnership with Fortune 500: 20-30 points
+    - Smaller deals or preliminary discussions: 0-15 points
     
-    2. Strategic Impact (0-30 points)
-    - Competitive advantage gains
-    - Partnership/alliance benefits
-    - Innovation/technology advancement
+    2. Strategic Impact (0-30 points) - ONLY assign points if:
+    - Entry into new major market/country: 20-30 points
+    - Game-changing technology acquisition: 15-25 points
+    - Routine expansion or minor partnerships: 0-10 points
     
-    3. Brand Enhancement (0-30 points)
-    - Positive media coverage
-    - Industry recognition/awards
-    - ESG/sustainability achievements
+    3. Brand Enhancement (0-30 points) - ONLY assign points if:
+    - Global award or #1 ranking: 20-30 points
+    - Major sustainability achievement: 15-25 points
+    - Regional recognition: 0-10 points
 
-    SPECIAL WEIGHTS:
-    - Direct mention of Samsung C&T or Samsung Construction: +20 points
-    - For Risks: Accidents with 10+ fatalities: +30 points
-    - For Risks: National-scale disasters/calamities: +25 points
-    - For Risks: Large-scale protests/political instability: +20 points
-    - For Opportunities: Contracts over $1 billion: +30 points
-    - For Opportunities: Entry into new markets/countries: +25 points
-    - For Opportunities: Major awards or #1 rankings: +20 points
+    SPECIAL WEIGHTS (apply ONLY when clearly applicable):
+    - Direct mention of Samsung C&T or Samsung Construction: +15 points (reduced from +20)
+    - For Risks: Confirmed deaths of 20+ people: +25 points (increased threshold)
+    - For Risks: National emergency officially declared: +20 points
+    - For Opportunities: Confirmed contracts over $2 billion: +25 points (increased threshold)
 
-    Note: If news source is from Samsung official channels, adjust points appropriately (reduce for risks, moderate increase for opportunities).
+    FILTERING RULES:
+    - If total score is below 40, generally classify as LOW and consider filtering out
+    - Only truly significant events should score above 60
+    - Reserve 85+ scores for catastrophic events or transformational opportunities
+
+    Note: Be skeptical of sensationalized headlines. Look for concrete facts and confirmed information.
 
     For each news item, respond in the following format:
     [News Number]
     EventType: (Risk/Opportunity)
-    RiskScore: (0-100, use 0 if Opportunity)
-    OpportunityScore: (0-100, use 0 if Risk)
-    RiskCategory: (Natural Disaster/Political Unrest/Accident/Health Crisis/Economic Crisis/Major Contract/Market Expansion/Business Achievement/Other)
-    KeyPoint: (One sentence summary of the risk or opportunity)
+    RiskScore: (0-100, be conservative)
+    OpportunityScore: (0-100, be conservative)
+    RiskCategory: (category name)
+    Reasoning: (Explain why score is low/medium/high)
+    KeyPoint: (One sentence summary)
 
     NEWS LIST:
     """
@@ -411,7 +462,7 @@ Reason: (Brief explanation)"""
         return prompt
     
     def _parse_risk_response(self, response_text: str, news_batch: List[NewsItem]) -> List[NewsItem]:
-        """AI 응답 파싱 - 위험과 기회 모두 처리"""
+        """AI 응답 파싱 - 조정된 임계값 적용"""
         results = []
         sections = response_text.split('[')
         
@@ -437,13 +488,13 @@ Reason: (Brief explanation)"""
                         else:
                             event_type = 'risk'
                     
-                    # Risk Score 파싱 (기존 로직)
+                    # Risk Score 파싱
                     elif 'riskscore:' in line_lower:
                         score_match = re.findall(r'\d+', line)
                         if score_match:
                             news.risk_score = float(score_match[0])
                     
-                    # Opportunity Score 파싱 (신규)
+                    # Opportunity Score 파싱
                     elif 'opportunityscore:' in line_lower:
                         score_match = re.findall(r'\d+', line)
                         if score_match:
@@ -455,30 +506,35 @@ Reason: (Brief explanation)"""
                         if len(parts) > 1:
                             news.risk_category = parts[1].strip()
                 
-                # 리스크 레벨 설정
+                # 리스크 레벨 설정 (조정된 임계값)
                 if event_type == 'opportunity' and opportunity_score > 0:
-                    # 기회는 risk_score에 opportunity_score를 저장 (통일된 처리를 위해)
                     news.risk_score = opportunity_score
                     
-                    # 중요한 기회는 HIGH로 분류하여 긴급알림 대상이 되도록
-                    if opportunity_score >= 70:
+                    # 기회 레벨 설정
+                    if opportunity_score >= 80:  # HIGH
                         news.risk_level = 'HIGH'
                         news.risk_category = f"OPPORTUNITY: {news.risk_category}"
-                    elif opportunity_score >= 40:
+                    elif opportunity_score >= 60:  # MEDIUM
                         news.risk_level = 'MEDIUM'
                         news.risk_category = f"OPPORTUNITY: {news.risk_category}"
-                    else:
+                    elif opportunity_score >= 40:  # LOW
                         news.risk_level = 'LOW'
+                        news.risk_category = f"OPPORTUNITY: {news.risk_category}"
+                    else:
+                        news.risk_level = 'VERY_LOW'
                 else:
-                    # 기존 리스크 레벨 로직
-                    if news.risk_score >= self.risk_thresholds['HIGH']:
+                    # 리스크 레벨 설정
+                    if news.risk_score >= self.risk_thresholds['HIGH']:  # 80
                         news.risk_level = 'HIGH'
                         news.risk_category = f"RISK: {news.risk_category}"
-                    elif news.risk_score >= self.risk_thresholds['MEDIUM']:
+                    elif news.risk_score >= self.risk_thresholds['MEDIUM']:  # 60
                         news.risk_level = 'MEDIUM'
                         news.risk_category = f"RISK: {news.risk_category}"
-                    else:
+                    elif news.risk_score >= self.risk_thresholds['LOW']:  # 40
                         news.risk_level = 'LOW'
+                        news.risk_category = f"RISK: {news.risk_category}"
+                    else:
+                        news.risk_level = 'VERY_LOW'
                 
                 news.ai_analysis_timestamp = datetime.now().isoformat()
                 results.append(news)
@@ -1024,162 +1080,216 @@ class AIRiskMonitoringSystem:
             return False
     
     def create_ai_html_report(self, analyzed_news: List[NewsItem]) -> str:
-        """AI 분석 결과를 포함한 HTML 리포트 생성 - HIGH, MEDIUM, LOW, COMPANY 모두 포함"""
-        # HIGH, MEDIUM, LOW, COMPANY 분류
-        high_risk = [n for n in analyzed_news if n.risk_level == 'HIGH']
+        """AI 분석 결과를 포함한 HTML 리포트 생성 - 삼성물산 최상단 표시"""
+        
+        # 분류 (COMPANY 제거, OPPORTUNITY 추가)
+        high_risk = [n for n in analyzed_news if n.risk_level == 'HIGH' and 'RISK:' in n.risk_category]
+        high_opportunities = [n for n in analyzed_news if n.risk_level == 'HIGH' and 'OPPORTUNITY:' in n.risk_category]
         medium_risk = [n for n in analyzed_news if n.risk_level == 'MEDIUM']
         low_risk = [n for n in analyzed_news if n.risk_level == 'LOW']
-        company_news = [n for n in analyzed_news if n.risk_level == 'COMPANY']
         
         # 국가별 통계 계산
         country_stats = {}
         for news in analyzed_news:
             country = news.country_ko or news.country
             if country not in country_stats:
-                country_stats[country] = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'COMPANY': 0, 'total': 0}
+                country_stats[country] = {'HIGH_RISK': 0, 'HIGH_OPP': 0, 'MEDIUM': 0, 'LOW': 0, 'total': 0}
             
-            if news.risk_level in ['HIGH', 'MEDIUM', 'LOW', 'COMPANY']:
-                country_stats[country][news.risk_level] += 1
-                country_stats[country]['total'] += 1
+            if news.risk_level == 'HIGH':
+                if 'OPPORTUNITY:' in news.risk_category:
+                    country_stats[country]['HIGH_OPP'] += 1
+                else:
+                    country_stats[country]['HIGH_RISK'] += 1
+            elif news.risk_level == 'MEDIUM':
+                country_stats[country]['MEDIUM'] += 1
+            elif news.risk_level == 'LOW':
+                country_stats[country]['LOW'] += 1
+            
+            country_stats[country]['total'] += 1
         
         # 인라인 스타일로 통일된 HTML
         html = f"""<!DOCTYPE html>
-    <html lang="ko">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>글로벌 리스크 모니터링 리포트 - {datetime.now().strftime('%Y-%m-%d')}</title>
-    </head>
-    <body style="margin: 0; padding: 0; font-family: 'Malgun Gothic', Arial, sans-serif; background-color: #f4f4f4;">
-        <div style="max-width: 800px; margin: 0 auto; background-color: #ffffff;">
-            
-            <!-- 헤더 -->
-            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px; text-align: center;">
-                <h1 style="color: #ffffff; margin: 0 0 10px 0; font-size: 32px;">🌍 G/O실 글로벌 리스크 모니터링 리포트</h1>
-                <div style="display: inline-block; background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px; color: white; font-size: 14px;">
-                    Powered by Gemini 2.0 Flash
+        <html lang="ko">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>글로벌 리스크 모니터링 리포트 - {datetime.now().strftime('%Y-%m-%d')}</title>
+        </head>
+        <body style="margin: 0; padding: 0; font-family: 'Malgun Gothic', Arial, sans-serif; background-color: #f4f4f4;">
+            <div style="max-width: 800px; margin: 0 auto; background-color: #ffffff;">
+                
+                <!-- 헤더 -->
+                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0 0 10px 0; font-size: 32px;">🌏 G/O실 글로벌 리스크 모니터링 리포트</h1>
+                    <div style="display: inline-block; background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px; color: white; font-size: 14px;">
+                        Powered by Gemini 2.0 Flash
+                    </div>
                 </div>
-            </div>
-            
-            <!-- 통계 카드 -->
-            <div style="background: #f8f9fa; padding: 30px; border-bottom: 2px solid #e9ecef;">
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr>
-                        <td style="text-align: center; padding: 15px;">
-                            <div style="font-size: 36px; font-weight: bold;">{len(analyzed_news)}</div>
-                            <div style="color: #666; margin-top: 5px; font-size: 12px;">Total News</div>
-                        </td>
-                        <td style="text-align: center; padding: 15px;">
-                            <div style="font-size: 36px; font-weight: bold; color: #dc3545;">{len(high_risk)}</div>
-                            <div style="color: #666; margin-top: 5px; font-size: 12px;">High Risk</div>
-                        </td>
-                        <td style="text-align: center; padding: 15px;">
-                            <div style="font-size: 36px; font-weight: bold; color: #ffc107;">{len(medium_risk)}</div>
-                            <div style="color: #666; margin-top: 5px; font-size: 12px;">Medium Risk</div>
-                        </td>
-                        <td style="text-align: center; padding: 15px;">
-                            <div style="font-size: 36px; font-weight: bold; color: #28a745;">{len(low_risk)}</div>
-                            <div style="color: #666; margin-top: 5px; font-size: 12px;">Low Risk</div>
-                        </td>
-                        <td style="text-align: center; padding: 15px;">
-                            <div style="font-size: 36px; font-weight: bold; color: #6c757d;">{len(company_news)}</div>
-                            <div style="color: #666; margin-top: 5px; font-size: 12px;">Company</div>
-                        </td>
-                    </tr>
-                </table>
-            </div>
-            
-            <!-- 국가별 리스크 현황 -->
-            <div style="padding: 30px; background-color: #f8f9fa;">
-                <h2 style="margin: 0 0 20px 0; color: #333;">📊 국가별 리스크 현황</h2>
-                <table style="width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
-                    <thead>
-                        <tr style="background-color: #6c757d; color: white;">
-                            <th style="padding: 12px; text-align: left; border: 1px solid #dee2e6;">국가</th>
-                            <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">HIGH</th>
-                            <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">MEDIUM</th>
-                            <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">LOW</th>
-                            <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">COMPANY</th>
-                            <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">소계</th>
-                        </tr>
-                    </thead>
-                    <tbody>"""
-        
-        # 국가별 통계 정렬 및 표시
-        for country, stats in sorted(country_stats.items(), key=lambda x: x[1]['total'], reverse=True):
-            html += f"""
+                
+                <!-- 통계 카드 -->
+                <div style="background: #f8f9fa; padding: 30px; border-bottom: 2px solid #e9ecef;">
+                    <table style="width: 100%; border-collapse: collapse;">
                         <tr>
-                            <td style="padding: 10px; border: 1px solid #dee2e6;">{country}</td>
-                            <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
-                                {f'<span style="background: #dc3545; color: white; padding: 2px 8px; border-radius: 4px;">{stats["HIGH"]}</span>' if stats['HIGH'] > 0 else '-'}
+                            <td style="text-align: center; padding: 15px;">
+                                <div style="font-size: 36px; font-weight: bold;">{len(analyzed_news)}</div>
+                                <div style="color: #666; margin-top: 5px; font-size: 12px;">Total News</div>
                             </td>
-                            <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
-                                {f'<span style="background: #ffc107; color: black; padding: 2px 8px; border-radius: 4px;">{stats["MEDIUM"]}</span>' if stats['MEDIUM'] > 0 else '-'}
+                            <td style="text-align: center; padding: 15px;">
+                                <div style="font-size: 36px; font-weight: bold; color: #dc3545;">{len(high_risk)}</div>
+                                <div style="color: #666; margin-top: 5px; font-size: 12px;">High Risk</div>
                             </td>
-                            <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
-                                {f'<span style="background: #28a745; color: white; padding: 2px 8px; border-radius: 4px;">{stats["LOW"]}</span>' if stats['LOW'] > 0 else '-'}
+                            <td style="text-align: center; padding: 15px;">
+                                <div style="font-size: 36px; font-weight: bold; color: #28a745;">{len(high_opportunities)}</div>
+                                <div style="color: #666; margin-top: 5px; font-size: 12px;">High Opportunity</div>
                             </td>
-                            <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
-                                {f'<span style="background: #6c757d; color: white; padding: 2px 8px; border-radius: 4px;">{stats["COMPANY"]}</span>' if stats['COMPANY'] > 0 else '-'}
+                            <td style="text-align: center; padding: 15px;">
+                                <div style="font-size: 36px; font-weight: bold; color: #ffc107;">{len(medium_risk)}</div>
+                                <div style="color: #666; margin-top: 5px; font-size: 12px;">Medium Risk</div>
                             </td>
-                            <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6; font-weight: bold;">{stats['total']}</td>
-                        </tr>"""
+                            <td style="text-align: center; padding: 15px;">
+                                <div style="font-size: 36px; font-weight: bold; color: #6c757d;">{len(low_risk)}</div>
+                                <div style="color: #666; margin-top: 5px; font-size: 12px;">Low Risk</div>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+                
+                <!-- 국가별 리스크 현황 -->
+                <div style="padding: 30px; background-color: #f8f9fa;">
+                    <h2 style="margin: 0 0 20px 0; color: #333;">📊 국가별 리스크 현황</h2>
+                    <table style="width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
+                        <thead>
+                            <tr style="background-color: #6c757d; color: white;">
+                                <th style="padding: 12px; text-align: left; border: 1px solid #dee2e6;">국가</th>
+                                <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">HIGH RISK</th>
+                                <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">HIGH OPP</th>
+                                <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">MEDIUM</th>
+                                <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">LOW</th>
+                                <th style="padding: 12px; text-align: center; border: 1px solid #dee2e6;">소계</th>
+                            </tr>
+                        </thead>
+                        <tbody>"""
+        
+        # 삼성물산 관련 뉴스 먼저 표시
+        samsung_keys = ['삼성물산', 'Samsung C&T', '해외']  # 회사 관련 키워드들
+        samsung_stats_displayed = False
+        
+        for key in samsung_keys:
+            if key in country_stats:
+                stats = country_stats[key]
+                # 삼성물산 행은 배경색을 다르게 하여 강조
+                html += f"""
+                            <tr style="background-color: #e3f2fd;">
+                                <td style="padding: 10px; border: 1px solid #dee2e6; font-weight: bold;">
+                                    🏢 {key}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
+                                    {f'<span style="background: #dc3545; color: white; padding: 2px 8px; border-radius: 4px;">{stats["HIGH_RISK"]}</span>' if stats['HIGH_RISK'] > 0 else '-'}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
+                                    {f'<span style="background: #28a745; color: white; padding: 2px 8px; border-radius: 4px;">{stats["HIGH_OPP"]}</span>' if stats['HIGH_OPP'] > 0 else '-'}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
+                                    {f'<span style="background: #ffc107; color: black; padding: 2px 8px; border-radius: 4px;">{stats["MEDIUM"]}</span>' if stats['MEDIUM'] > 0 else '-'}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
+                                    {f'<span style="background: #6c757d; color: white; padding: 2px 8px; border-radius: 4px;">{stats["LOW"]}</span>' if stats['LOW'] > 0 else '-'}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6; font-weight: bold;">
+                                    {stats['total']}
+                                </td>
+                            </tr>"""
+                samsung_stats_displayed = True
+                break  # 하나만 표시
+        
+        # 구분선 추가 (삼성물산과 다른 국가 구분)
+        if samsung_stats_displayed and len(country_stats) > 1:
+            html += """
+                            <tr>
+                                <td colspan="6" style="padding: 0; border: none; background-color: #dee2e6; height: 2px;"></td>
+                            </tr>"""
+        
+        # 나머지 국가들을 total 기준으로 정렬하여 표시
+        other_countries = sorted(
+            [(k, v) for k, v in country_stats.items() if k not in samsung_keys],
+            key=lambda x: x[1]['total'],
+            reverse=True
+        )
+        
+        for country, stats in other_countries:
+            html += f"""
+                            <tr>
+                                <td style="padding: 10px; border: 1px solid #dee2e6;">{country}</td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
+                                    {f'<span style="background: #dc3545; color: white; padding: 2px 8px; border-radius: 4px;">{stats["HIGH_RISK"]}</span>' if stats['HIGH_RISK'] > 0 else '-'}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
+                                    {f'<span style="background: #28a745; color: white; padding: 2px 8px; border-radius: 4px;">{stats["HIGH_OPP"]}</span>' if stats['HIGH_OPP'] > 0 else '-'}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
+                                    {f'<span style="background: #ffc107; color: black; padding: 2px 8px; border-radius: 4px;">{stats["MEDIUM"]}</span>' if stats['MEDIUM'] > 0 else '-'}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
+                                    {f'<span style="background: #6c757d; color: white; padding: 2px 8px; border-radius: 4px;">{stats["LOW"]}</span>' if stats['LOW'] > 0 else '-'}
+                                </td>
+                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6; font-weight: bold;">{stats['total']}</td>
+                            </tr>"""
         
         html += """
-                    </tbody>
-                </table>
-            </div>
-            
-            <!-- 뉴스 내용 -->
-            <div style="padding: 40px;">
-    """
+                        </tbody>
+                    </table>
+                </div>
+                
+                <!-- 뉴스 내용 -->
+                <div style="padding: 40px;">
+        """
         
-        # COMPANY NEWS 섹션 (최상단)
-        if company_news:
+        # HIGH OPPORTUNITY 섹션 (최상단)
+        if high_opportunities:
             html += """
-                <h2 style="color: #6c757d; margin: 30px 0 20px 0;">🏢 COMPANY NEWS - 삼성물산 관련</h2>"""
-            for news in company_news:
-                html += self._create_ai_news_card(news, 'company')
+                    <h2 style="color: #28a745; margin: 30px 0 20px 0;">💎 HIGH OPPORTUNITY - 주요 비즈니스 기회</h2>"""
+            for news in high_opportunities:
+                html += self._create_ai_news_card(news, 'opportunity')
         
         # HIGH RISK 섹션
         if high_risk:
             html += """
-                <h2 style="color: #dc3545; margin: 30px 0 20px 0;">⚠️ HIGH RISK - 즉시 확인 필요</h2>"""
+                    <h2 style="color: #dc3545; margin: 30px 0 20px 0;">⚠️ HIGH RISK - 즉시 확인 필요</h2>"""
             for news in high_risk:
                 html += self._create_ai_news_card(news, 'high')
         
         # MEDIUM RISK 섹션
         if medium_risk:
             html += """
-                <h2 style="color: #ffc107; margin: 30px 0 20px 0;">🔔 MEDIUM RISK - 주의 필요</h2>"""
+                    <h2 style="color: #ffc107; margin: 30px 0 20px 0;">🔔 MEDIUM RISK - 주의 필요</h2>"""
             for news in medium_risk:
                 html += self._create_ai_news_card(news, 'medium')
         
         # LOW RISK 섹션
         if low_risk:
             html += """
-                <h2 style="color: #28a745; margin: 30px 0 20px 0;">ℹ️ LOW RISK - 모니터링</h2>"""
+                    <h2 style="color: #6c757d; margin: 30px 0 20px 0;">ℹ️ LOW RISK - 모니터링</h2>"""
             for news in low_risk:
                 html += self._create_ai_news_card(news, 'low')
         
         html += """
+                </div>
+                
+                <!-- 푸터 -->
+                <div style="background-color: #f8f9fa; padding: 20px; text-align: center; border-top: 1px solid #dee2e6;">
+                    <p style="margin: 0; color: #666; font-size: 12px;">
+                        Samsung C&T Risk Monitoring System<br>
+                        Generated at """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """
+                    </p>
+                </div>
             </div>
-            
-            <!-- 푸터 -->
-            <div style="background-color: #f8f9fa; padding: 20px; text-align: center; border-top: 1px solid #dee2e6;">
-                <p style="margin: 0; color: #666; font-size: 12px;">
-                    Samsung C&T Risk Monitoring System<br>
-                    Generated at """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """
-                </p>
-            </div>
-        </div>
-    </body>
-    </html>"""
+        </body>
+        </html>"""
         
         return html
     
     def _create_ai_news_card(self, news: NewsItem, risk_class: str) -> str:
-        """뉴스 카드 HTML 생성"""
+        """뉴스 카드 HTML 생성 - opportunity 클래스 추가"""
         import html
         
         # 한국어 제목 우선 사용
@@ -1189,37 +1299,42 @@ class AIRiskMonitoringSystem:
         color_map = {
             'high': '#dc3545',
             'medium': '#ffc107', 
-            'low': '#28a745',
-            'company': '#6c757d'
+            'low': '#6c757d',
+            'opportunity': '#28a745'  # 기회 색상 추가
         }
         border_color = color_map.get(risk_class, '#6c757d')
         
-        # 리스크 점수 표시 - COMPANY는 점수 대신 카테고리만 표시
-        if risk_class == 'company':
-            risk_info = f"<strong>카테고리:</strong> 회사 관련 뉴스"
+        # 카테고리 표시 정리
+        category_display = news.risk_category.replace('RISK: ', '').replace('OPPORTUNITY: ', '')
+        
+        # 기회/위험에 따른 라벨
+        if risk_class == 'opportunity':
+            score_label = "중요도"
+            category_label = "기회 유형"
         else:
-            risk_info = f"""<strong>리스크 점수:</strong> {news.risk_score:.0f} | 
-                            <strong>카테고리:</strong> {news.risk_category or 'Other'}"""
+            score_label = "리스크 점수"
+            category_label = "카테고리"
         
         return f"""
-        <div style="background: white; border: 1px solid #e9ecef; border-left: 5px solid {border_color}; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
-            <h3 style="margin: 0 0 10px 0; color: #333; font-size: 18px;">{html.escape(title_to_display)}</h3>
-            <p style="margin: 10px 0; color: #666; font-size: 13px;">
-                📍 {news.country_ko or news.country} | 📰 {html.escape(news.source)} | 📅 {news.date}
-            </p>
-            <p style="margin: 10px 0;">
-                {risk_info}
-            </p>
-            <div style="background: #f8f9fa; padding: 10px; border-radius: 4px; margin: 15px 0;">
-                <strong>AI 요약:</strong><br>
-                <p style="margin: 5px 0; color: #333; line-height: 1.6;">
-                    {html.escape(news.ai_summary_ko or 'No summary')}
+            <div style="background: white; border: 1px solid #e9ecef; border-left: 5px solid {border_color}; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
+                <h3 style="margin: 0 0 10px 0; color: #333; font-size: 18px;">{html.escape(title_to_display)}</h3>
+                <p style="margin: 10px 0; color: #666; font-size: 13px;">
+                    📍 {news.country_ko or news.country} | 📰 {html.escape(news.source)} | 📅 {news.date}
                 </p>
-            </div>
-            <a href="{news.link}" target="_blank" style="display: inline-block; padding: 8px 16px; background: #007bff; color: white; text-decoration: none; border-radius: 4px; font-size: 14px;">
-                원문 보기 →
-            </a>
-        </div>"""
+                <p style="margin: 10px 0;">
+                    <strong>{score_label}:</strong> {news.risk_score:.0f} | 
+                    <strong>{category_label}:</strong> {category_display}
+                </p>
+                <div style="background: #f8f9fa; padding: 10px; border-radius: 4px; margin: 15px 0;">
+                    <strong>AI 요약:</strong><br>
+                    <p style="margin: 5px 0; color: #333; line-height: 1.6;">
+                        {html.escape(news.ai_summary_ko or 'No summary')}
+                    </p>
+                </div>
+                <a href="{news.link}" target="_blank" style="display: inline-block; padding: 8px 16px; background: #007bff; color: white; text-decoration: none; border-radius: 4px; font-size: 14px;">
+                    원문 보기 →
+                </a>
+            </div>"""
     
     def send_email_report(self, html_content: str, news_list: List[NewsItem]) -> bool:
         """이메일로 리포트 전송"""
@@ -1383,29 +1498,37 @@ class AIRiskMonitoringSystem:
                 if high_opportunities:
                     subject_parts.append(f"기회 {len(high_opportunities)}건")
                 
-                subject = f"[긴급] 삼성물산 - {' / '.join(subject_parts)} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                subject = f"[알림] 삼성물산 - {' / '.join(subject_parts)} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
                 
                 html_content = self.create_urgent_company_report(high_risk, report_type='urgent')
                 self.send_email_to_recipients(html_content, subject, self.email_config['recipients'])
                 
                 logger.info(f"📧 긴급 알림 발송 (위험: {len(high_risks)}건, 기회: {len(high_opportunities)}건)")
             
-            # 2. 관리자: 모든 뉴스 전송 (HIGH, MEDIUM, LOW 포함)
+            # 2. 관리자: 모든 뉴스 전송 (HIGH, MEDIUM, LOW + OPPORTUNITY 모두 포함)
             if final_news and self.email_config.get('admin_email'):
                 html_content_admin = self.create_urgent_company_report(final_news, report_type='admin')
                 
-                # 리스크 레벨별 카운트 표시
+                # 세부적인 카운트 표시
                 risk_summary = []
-                if high_risk:
-                    risk_summary.append(f"HIGH {len(high_risk)}건")
-                if medium_risk:
-                    risk_summary.append(f"MEDIUM {len(medium_risk)}건")
-                if low_risk:
-                    risk_summary.append(f"LOW {len(low_risk)}건")
-                if company_level:
-                    risk_summary.append(f"COMPANY {len(company_level)}건")
                 
-                subject_admin = f"[관리자] 삼성물산 모니터링 - {' / '.join(risk_summary) if risk_summary else '새 뉴스 없음'} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                # OPPORTUNITY와 RISK 구분하여 카운트
+                high_opp = len([n for n in final_news if n.risk_level == 'HIGH' and 'OPPORTUNITY:' in n.risk_category])
+                high_risk = len([n for n in final_news if n.risk_level == 'HIGH' and 'RISK:' in n.risk_category])
+                med_opp = len([n for n in final_news if n.risk_level == 'MEDIUM' and 'OPPORTUNITY:' in n.risk_category])
+                med_risk = len([n for n in final_news if n.risk_level == 'MEDIUM' and 'RISK:' in n.risk_category])
+                low_opp = len([n for n in final_news if n.risk_level == 'LOW' and 'OPPORTUNITY:' in n.risk_category])
+                low_risk = len([n for n in final_news if n.risk_level == 'LOW' and 'RISK:' in n.risk_category])
+                
+                # 요약 텍스트 생성
+                if high_opp + high_risk > 0:
+                    risk_summary.append(f"HIGH(위험{high_risk}/기회{high_opp})")
+                if med_opp + med_risk > 0:
+                    risk_summary.append(f"MED(위험{med_risk}/기회{med_opp})")
+                if low_opp + low_risk > 0:
+                    risk_summary.append(f"LOW(위험{low_risk}/기회{low_opp})")
+                
+                subject_admin = f"[관리자] 삼성물산 - {' / '.join(risk_summary) if risk_summary else '새 뉴스 없음'} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
                 
                 # 관리자에게 전송
                 self.send_email_to_recipients(html_content_admin, subject_admin, [self.email_config['admin_email']])
@@ -1551,148 +1674,198 @@ class AIRiskMonitoringSystem:
         return all_news
 
     def create_urgent_company_report(self, news_list: List[NewsItem], report_type: str = 'urgent') -> str:
-        """긴급 회사 뉴스 이메일 리포트 생성
+        """긴급 회사 뉴스 이메일 리포트 생성"""
         
-        Args:
-            news_list: 뉴스 리스트
-            report_type: 'urgent' (HIGH/MEDIUM만) 또는 'admin' (전체)
-        """
-        # 리스크 레벨별 분류
-        high_risk = [n for n in news_list if n.risk_level == 'HIGH']
-        medium_risk = [n for n in news_list if n.risk_level == 'MEDIUM']
-        low_risk = [n for n in news_list if n.risk_level == 'LOW']
-        company_news = [n for n in news_list if n.risk_level == 'COMPANY']
+        # 리스크와 기회 분류 (OPPORTUNITY 구분 추가)
+        high_risks = [n for n in news_list if n.risk_level == 'HIGH' and 'RISK:' in n.risk_category]
+        high_opportunities = [n for n in news_list if n.risk_level == 'HIGH' and 'OPPORTUNITY:' in n.risk_category]
+        medium_risks = [n for n in news_list if n.risk_level == 'MEDIUM' and 'RISK:' in n.risk_category]
+        medium_opportunities = [n for n in news_list if n.risk_level == 'MEDIUM' and 'OPPORTUNITY:' in n.risk_category]
+        low_risks = [n for n in news_list if n.risk_level == 'LOW' and 'RISK:' in n.risk_category]
+        low_opportunities = [n for n in news_list if n.risk_level == 'LOW' and 'OPPORTUNITY:' in n.risk_category]
         
-        # 전체 뉴스 개수
         total_news = len(news_list)
         
-        # 리포트 타입에 따른 제목과 색상
+        # 리포트 타입에 따른 설정
         if report_type == 'admin':
             header_color = '#17a2b8'  # 청록색 (관리자용)
             header_title = "📊 삼성물산 전체 모니터링 리포트 (관리자)"
-            alert_message = f"전체 {total_news}건의 뉴스가 감지되었습니다."
+            show_alert = True
         else:
-            header_color = '#dc3545' if high_risk else '#ffc107'
-            header_title = "⚠️ 삼성물산 관련 긴급 뉴스"
-            alert_message = f"중요도 높은 뉴스 {len(high_risk) + len(medium_risk)}건이 감지되었습니다."
+            if high_opportunities and not high_risks:
+                header_color = '#28a745'  # 녹색
+                header_title = "🎯 삼성물산 주요 비즈니스 기회"
+                show_alert = False
+            elif high_risks:
+                header_color = '#dc3545'  # 빨간색
+                header_title = "⚠️ 삼성물산 관련 긴급 뉴스"
+                show_alert = True
+            else:
+                header_color = '#6c757d'
+                header_title = "📰 삼성물산 관련 뉴스"
+                show_alert = False
         
         html = f"""<!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>삼성물산 관련 뉴스</title>
-    </head>
-    <body style="margin: 0; padding: 0; font-family: 'Malgun Gothic', Arial, sans-serif; background-color: #f4f4f4;">
-        <div style="max-width: 700px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-            <div style="background-color: {header_color}; padding: 25px; text-align: center;">
-                <h1 style="color: #ffffff; margin: 0; font-size: 26px;">{header_title}</h1>
-                <p style="color: #ffffff; margin: 10px 0 0 0; font-size: 14px;">
-                    {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')} | {total_news}건 감지
-                </p>
-            </div>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>삼성물산 관련 뉴스</title>
+        </head>
+        <body style="margin: 0; padding: 0; font-family: 'Malgun Gothic', Arial, sans-serif; background-color: #f4f4f4;">
+            <div style="max-width: 700px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                <div style="background-color: {header_color}; padding: 25px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0; font-size: 26px;">{header_title}</h1>
+                    <p style="color: #ffffff; margin: 10px 0 0 0; font-size: 14px;">
+                        {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')} | {total_news}건 감지
+                    </p>
+                </div>
+                
+                <div style="padding: 25px;">"""
+        
+        # 알림 박스 (관리자 모드는 항상 표시)
+        if report_type == 'admin' or (show_alert and high_risks):
+            if report_type == 'admin':
+                alert_message = f"전체 {total_news}건의 뉴스가 감지되었습니다."
+            else:
+                alert_message = f"{len(high_risks)}건의 위험 사항이 감지되었습니다."
             
-            <div style="padding: 25px;">
-                <div style="background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin-bottom: 20px;">
-                    <p style="margin: 0; color: #856404;">
-                        <strong>알림:</strong> {alert_message}
-                    </p>
-                    <p style="margin: 5px 0 0 0; color: #856404; font-size: 13px;">
-                        HIGH: {len(high_risk)}건 | MEDIUM: {len(medium_risk)}건 | LOW: {len(low_risk)}건 | COMPANY: {len(company_news)}건
-                    </p>
-                </div>"""
+            html += f"""
+                    <div style="background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin-bottom: 20px;">
+                        <p style="margin: 0; color: #856404;">
+                            <strong>알림:</strong> {alert_message}
+                        </p>
+                        <p style="margin: 5px 0 0 0; color: #856404; font-size: 13px;">
+                            위험 HIGH: {len(high_risks)}건 | 기회 HIGH: {len(high_opportunities)}건 | 
+                            위험 MED: {len(medium_risks)}건 | 기회 MED: {len(medium_opportunities)}건 | 
+                            위험 LOW: {len(low_risks)}건 | 기회 LOW: {len(low_opportunities)}건
+                        </p>
+                    </div>"""
         
         news_counter = 1
         
-        # HIGH RISK 뉴스
-        if high_risk:
+        # HIGH OPPORTUNITY 뉴스
+        if high_opportunities:
             html += f"""
-                <h2 style="color: #dc3545; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #dc3545; padding-bottom: 5px;">
-                    🔴 HIGH RISK ({len(high_risk)})
-                </h2>"""
+                    <h2 style="color: #28a745; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #28a745; padding-bottom: 5px;">
+                        💎 HIGH OPPORTUNITY ({len(high_opportunities)})
+                    </h2>"""
             
-            for news in high_risk:
+            for news in high_opportunities:
+                html += self._create_urgent_news_item(news, news_counter, '#28a745')
+                news_counter += 1
+        
+        # HIGH RISK 뉴스
+        if high_risks:
+            html += f"""
+                    <h2 style="color: #dc3545; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #dc3545; padding-bottom: 5px;">
+                        🔴 HIGH RISK ({len(high_risks)})
+                    </h2>"""
+            
+            for news in high_risks:
                 html += self._create_urgent_news_item(news, news_counter, '#dc3545')
                 news_counter += 1
         
-        # MEDIUM RISK 뉴스
-        if medium_risk:
-            html += f"""
-                <h2 style="color: #ffc107; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #ffc107; padding-bottom: 5px;">
-                    🟡 MEDIUM RISK ({len(medium_risk)})
-                </h2>"""
-            
-            for news in medium_risk:
-                html += self._create_urgent_news_item(news, news_counter, '#ffc107')
-                news_counter += 1
-        
-        # 관리자 리포트인 경우에만 LOW와 COMPANY 포함
+        # 관리자 모드에서만 MEDIUM, LOW 포함
         if report_type == 'admin':
-            # LOW RISK 뉴스
-            if low_risk:
+            # MEDIUM OPPORTUNITY
+            if medium_opportunities:
                 html += f"""
-                    <h2 style="color: #28a745; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #28a745; padding-bottom: 5px;">
-                        🟢 LOW RISK ({len(low_risk)})
-                    </h2>"""
+                        <h2 style="color: #17a2b8; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #17a2b8; padding-bottom: 5px;">
+                            💼 MEDIUM OPPORTUNITY ({len(medium_opportunities)})
+                        </h2>"""
                 
-                for news in low_risk:
-                    html += self._create_urgent_news_item(news, news_counter, '#28a745')
+                for news in medium_opportunities:
+                    html += self._create_urgent_news_item(news, news_counter, '#17a2b8')
                     news_counter += 1
             
-            # COMPANY 뉴스
-            if company_news:
+            # MEDIUM RISK
+            if medium_risks:
                 html += f"""
-                    <h2 style="color: #6c757d; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #6c757d; padding-bottom: 5px;">
-                        🏢 COMPANY NEWS ({len(company_news)})
-                    </h2>"""
+                        <h2 style="color: #ffc107; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #ffc107; padding-bottom: 5px;">
+                            🟡 MEDIUM RISK ({len(medium_risks)})
+                        </h2>"""
                 
-                for news in company_news:
+                for news in medium_risks:
+                    html += self._create_urgent_news_item(news, news_counter, '#ffc107')
+                    news_counter += 1
+            
+            # LOW OPPORTUNITY
+            if low_opportunities:
+                html += f"""
+                        <h2 style="color: #20c997; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #20c997; padding-bottom: 5px;">
+                            📈 LOW OPPORTUNITY ({len(low_opportunities)})
+                        </h2>"""
+                
+                for news in low_opportunities:
+                    html += self._create_urgent_news_item(news, news_counter, '#20c997')
+                    news_counter += 1
+            
+            # LOW RISK
+            if low_risks:
+                html += f"""
+                        <h2 style="color: #6c757d; margin: 25px 0 15px 0; font-size: 20px; border-bottom: 2px solid #6c757d; padding-bottom: 5px;">
+                            ⚪ LOW RISK ({len(low_risks)})
+                        </h2>"""
+                
+                for news in low_risks:
                     html += self._create_urgent_news_item(news, news_counter, '#6c757d')
                     news_counter += 1
         
         html += """
+                </div>
+                <div style="background-color: #f8f9fa; padding: 20px; text-align: center; border-top: 1px solid #dee2e6;">
+                    <p style="margin: 0; color: #666; font-size: 12px;">
+                        Samsung C&T Risk Monitoring System<br>
+                        3시간 주기 자동 모니터링
+                    </p>
+                </div>
             </div>
-            <div style="background-color: #f8f9fa; padding: 20px; text-align: center; border-top: 1px solid #dee2e6;">
-                <p style="margin: 0; color: #666; font-size: 12px;">
-                    Samsung C&T Risk Monitoring System<br>
-                    3시간 주기 자동 모니터링
-                </p>
-            </div>
-        </div>
-    </body>
-    </html>"""
+        </body>
+        </html>"""
         return html
 
     def _create_urgent_news_item(self, news: NewsItem, idx: int, border_color: str) -> str:
-        """개별 뉴스 아이템 HTML 생성 (헬퍼 메소드)"""
+        """개별 뉴스 아이템 HTML 생성"""
         title_to_display = news.ai_title_ko if news.ai_title_ko else news.title
         
-        # 리스크 정보 표시 (COMPANY는 카테고리만)
-        if news.risk_level == 'COMPANY':
-            risk_info = f"카테고리: {news.risk_category or 'Company News'}"
+        # 카테고리에서 기회/리스크 구분
+        is_opportunity = 'OPPORTUNITY:' in news.risk_category
+        
+        # 카테고리 표시 정리
+        category_display = news.risk_category.replace('RISK: ', '').replace('OPPORTUNITY: ', '')
+        
+        # 기회/위험에 따른 라벨 및 배경색
+        if is_opportunity:
+            score_label = "중요도 점수"
+            category_label = "기회 유형"
+            bg_color = "#f0f9ff"  # 연한 파란색 배경
         else:
-            risk_info = f"<strong style='color: {border_color};'>리스크 점수: {news.risk_score:.0f}</strong> | 카테고리: {news.risk_category or 'Other'}"
+            score_label = "리스크 점수"
+            category_label = "위험 유형"
+            bg_color = "#f8f9fa"  # 기존 회색 배경
         
         return f"""
-        <div style="border: 1px solid #dee2e6; border-left: 5px solid {border_color}; padding: 20px; margin-bottom: 20px; background-color: #f8f9fa;">
-            <h3 style="margin: 0 0 10px 0; color: #333; font-size: 18px;">
-                {idx}. {title_to_display}
-            </h3>
-            <div style="margin: 10px 0; color: #666; font-size: 13px;">
-                📰 {news.source} | 📅 {news.date}
-            </div>
-            <div style="margin: 15px 0; padding: 10px; background-color: #ffffff; border-radius: 4px;">
-                {risk_info}
-            </div>
-            <div style="margin: 15px 0; padding: 10px; background-color: #ffffff; border-radius: 4px;">
-                <strong>AI 요약:</strong><br>
-                <p style="margin: 5px 0; color: #333; line-height: 1.6;">
-                    {news.ai_summary_ko or '요약 생성 중...'}
-                </p>
-            </div>
-            <a href="{news.link}" style="display: inline-block; margin-top: 10px; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;">
-                원문 보기 →
-            </a>
-        </div>"""
+            <div style="border: 1px solid #dee2e6; border-left: 5px solid {border_color}; padding: 20px; margin-bottom: 20px; background-color: {bg_color};">
+                <h3 style="margin: 0 0 10px 0; color: #333; font-size: 18px;">
+                    {idx}. {title_to_display}
+                </h3>
+                <div style="margin: 10px 0; color: #666; font-size: 13px;">
+                    📰 {news.source} | 📅 {news.date}
+                </div>
+                <div style="margin: 15px 0; padding: 10px; background-color: #ffffff; border-radius: 4px;">
+                    <strong style='color: {border_color};'>{score_label}: {news.risk_score:.0f}</strong> | 
+                    {category_label}: {category_display}
+                </div>
+                <div style="margin: 15px 0; padding: 10px; background-color: #ffffff; border-radius: 4px;">
+                    <strong>AI 요약:</strong><br>
+                    <p style="margin: 5px 0; color: #333; line-height: 1.6;">
+                        {news.ai_summary_ko or '요약 생성 중...'}
+                    </p>
+                </div>
+                <a href="{news.link}" style="display: inline-block; margin-top: 10px; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;">
+                    원문 보기 →
+                </a>
+            </div>"""
 
     def send_urgent_email(self, html_content: str, subject: str) -> bool:
         """긴급 이메일 전송"""
