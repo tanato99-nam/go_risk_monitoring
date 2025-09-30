@@ -57,6 +57,9 @@ class CompanyNewsCache:
     def __init__(self, cache_file='company_news_cache.pkl'):
         self.cache_file = cache_file
         self.cache = self.load_cache()
+        # 최근 처리된 뉴스 목록 유지 (AI 중복 체크용)
+        self.recent_news_file = 'company_recent_news.pkl'
+        self.recent_news = self.load_recent_news()
     
     def load_cache(self) -> Set[str]:
         """캐시 로드"""
@@ -68,10 +71,25 @@ class CompanyNewsCache:
                 return set()
         return set()
     
+    def load_recent_news(self) -> List[NewsItem]:
+        """최근 처리된 뉴스 목록 로드"""
+        if Path(self.recent_news_file).exists():
+            try:
+                with open(self.recent_news_file, 'rb') as f:
+                    return pickle.load(f)
+            except:
+                return []
+        return []
+    
     def save_cache(self):
         """캐시 저장"""
         with open(self.cache_file, 'wb') as f:
             pickle.dump(self.cache, f)
+    
+    def save_recent_news(self):
+        """최근 뉴스 목록 저장"""
+        with open(self.recent_news_file, 'wb') as f:
+            pickle.dump(self.recent_news, f)
     
     def is_new_news(self, news_hash: str) -> bool:
         """새로운 뉴스인지 확인"""
@@ -80,6 +98,29 @@ class CompanyNewsCache:
     def add_news(self, news_hash: str):
         """뉴스 해시 추가"""
         self.cache.add(news_hash)
+        
+    def add_recent_news(self, news_item: NewsItem):
+        """최근 뉴스 목록에 추가 (최대 100개 유지)"""
+        self.recent_news.append(news_item)
+        # 최근 100개만 유지 (메모리 관리)
+        if len(self.recent_news) > 100:
+            self.recent_news = self.recent_news[-100:]
+    
+    def get_recent_news_for_comparison(self, days: int = 7) -> List[NewsItem]:
+        """비교를 위한 최근 뉴스 반환 (기본 7일)"""
+        cutoff_date = datetime.now() - timedelta(days=days)
+        filtered_news = []
+        
+        for news in self.recent_news:
+            try:
+                news_date = parser.parse(news.collected_at)
+                if news_date >= cutoff_date:
+                    filtered_news.append(news)
+            except:
+                # 날짜 파싱 실패 시 포함
+                filtered_news.append(news)
+        
+        return filtered_news
     
     def clear_old_cache(self):
         """오래된 캐시 정리 (선택적)"""
@@ -640,6 +681,47 @@ Reason: (Brief explanation)"""
         
         logger.info(f"✅ 요약 및 번역 완료: {processed}건 처리")
         return news_list
+
+    def remove_company_duplicates(self, new_news: List[NewsItem], 
+                                 existing_news: List[NewsItem]) -> List[NewsItem]:
+        """회사 뉴스 전용 중복 제거 - 기존 뉴스와 비교"""
+        
+        logger.info("🔍 회사 뉴스 AI 기반 중복 제거 시작...")
+        
+        if not new_news:
+            return []
+        
+        if not existing_news:
+            # 기존 뉴스가 없으면 모두 새로운 뉴스
+            return new_news
+        
+        unique_news = []
+        duplicate_count = 0
+        
+        for candidate in new_news:
+            is_duplicate = False
+            duplicate_of = None
+            
+            # 기존 뉴스와 비교 (최대 20개와 비교)
+            comparison_news = existing_news[-20:] if len(existing_news) > 20 else existing_news
+            
+            if comparison_news:
+                is_duplicate, duplicate_of = self._check_duplicate_with_ai(
+                    candidate, 
+                    comparison_news
+                )
+            
+            if not is_duplicate:
+                unique_news.append(candidate)
+                logger.debug(f"  ✓ 새로운 뉴스: {candidate.title[:50]}...")
+            else:
+                duplicate_count += 1
+                candidate.is_duplicate = True
+                candidate.duplicate_of = duplicate_of or ""
+                logger.debug(f"  ✗ 중복 제거: {candidate.title[:50]}...")
+        
+        logger.info(f"✅ 회사 뉴스 중복 제거 완료: {len(new_news)}건 → {len(unique_news)}건 (중복 {duplicate_count}건)")
+        return unique_news
 
 class AIRiskMonitoringSystem:
     """AI 기반 리스크 모니터링 시스템"""
@@ -1452,46 +1534,76 @@ class AIRiskMonitoringSystem:
         logger.info("="*70)
 
     def run_company_monitoring(self, company_cache: CompanyNewsCache):
-        """회사 관련 뉴스만 모니터링 (3시간 주기)"""
+        """회사 관련 뉴스만 모니터링 (3시간 주기) - GeminiAnalyzer 방식 사용"""
         logger.info("\n" + "="*70)
         logger.info("🏢 회사 관련 뉴스 모니터링 시작 (3시간 주기)")
         logger.info("="*70)
         
         try:
-            # 회사 뉴스만 수집
+            # 1. 회사 뉴스 수집
             company_news = self.collect_company_news_only()
             
-            # 새로운 뉴스만 필터링
-            new_news = []
-            for news in company_news:
-                if company_cache.is_new_news(news.news_hash):
-                    new_news.append(news)
-                    company_cache.add_news(news.news_hash)
-            
-            if not new_news:
-                logger.info("ℹ️ 새로운 회사 관련 뉴스 없음")
+            if not company_news:
+                logger.info("ℹ️ 수집된 회사 뉴스 없음")
                 return True
             
-            logger.info(f"🆕 {len(new_news)}건의 새로운 회사 뉴스 발견")
+            logger.info(f"📰 {len(company_news)}건의 회사 뉴스 수집")
             
-            # AI 분석
-            unique_news = self.analyzer.remove_duplicates(new_news)
-            analyzed_news = self.analyzer.analyze_risk_batch(unique_news)
+            # 2. 완전 중복 제거 (해시 기반)
+            hash_filtered_news = []
+            for news in company_news:
+                if company_cache.is_new_news(news.news_hash):
+                    hash_filtered_news.append(news)
+                    company_cache.add_news(news.news_hash)
+                else:
+                    logger.debug(f"  ✗ 해시 중복: {news.title[:50]}...")
+            
+            if not hash_filtered_news:
+                logger.info("ℹ️ 모든 뉴스가 해시 중복 (완전 동일)")
+                return True
+            
+            logger.info(f"📋 해시 중복 제거 후: {len(hash_filtered_news)}건")
+            
+            # 3. AI 기반 의미적 중복 제거 (기존 뉴스와 비교)
+            existing_news = company_cache.get_recent_news_for_comparison(days=7)
+            
+            # GeminiAnalyzer의 중복 제거 방식 사용
+            unique_news = self.analyzer.remove_company_duplicates(
+                hash_filtered_news, 
+                existing_news
+            )
+            
+            if not unique_news:
+                logger.info("ℹ️ 모든 뉴스가 의미적 중복 (같은 사건)")
+                company_cache.save_cache()
+                company_cache.save_recent_news()
+                return True
+            
+            logger.info(f"🆕 {len(unique_news)}건의 진짜 새로운 회사 뉴스 발견")
+            
+            # 4. 새로운 뉴스들 간의 중복 제거 (서로 다른 소스에서 온 같은 사건)
+            final_unique_news = self.analyzer.remove_duplicates(unique_news)
+            
+            # 5. AI 리스크 분석
+            analyzed_news = self.analyzer.analyze_risk_batch(final_unique_news)
+            
+            # 6. 번역 및 요약
             final_news = self.analyzer.summarize_and_translate(analyzed_news)
             
-            # 리스크 레벨별 분류
+            # 7. 처리된 뉴스를 최근 뉴스 목록에 추가
+            for news in final_news:
+                company_cache.add_recent_news(news)
+            
+            # 8. 리스크 레벨별 분류
             high_risk = [n for n in final_news if n.risk_level == 'HIGH']
             medium_risk = [n for n in final_news if n.risk_level == 'MEDIUM']
             low_risk = [n for n in final_news if n.risk_level == 'LOW']
-            company_level = [n for n in final_news if n.risk_level == 'COMPANY']
             
-            # 1. 일반 수신자: HIGH RISK 또는 HIGH OPPORTUNITY 긴급 알림
+            # 9. 이메일 발송 (기존 로직 유지)
             if high_risk and self.email_config['recipients']:
-                # 리스크와 기회 구분
                 high_risks = [n for n in high_risk if 'RISK:' in n.risk_category]
                 high_opportunities = [n for n in high_risk if 'OPPORTUNITY:' in n.risk_category]
                 
-                # 제목 생성
                 subject_parts = []
                 if high_risks:
                     subject_parts.append(f"위험 {len(high_risks)}건")
@@ -1505,45 +1617,40 @@ class AIRiskMonitoringSystem:
                 
                 logger.info(f"📧 긴급 알림 발송 (위험: {len(high_risks)}건, 기회: {len(high_opportunities)}건)")
             
-            # 2. 관리자: 모든 뉴스 전송 (HIGH, MEDIUM, LOW + OPPORTUNITY 모두 포함)
+            # 10. 관리자 전체 리포트
             if final_news and self.email_config.get('admin_email'):
                 html_content_admin = self.create_urgent_company_report(final_news, report_type='admin')
                 
-                # 세부적인 카운트 표시
-                risk_summary = []
-                
-                # OPPORTUNITY와 RISK 구분하여 카운트
+                # 통계 생성
                 high_opp = len([n for n in final_news if n.risk_level == 'HIGH' and 'OPPORTUNITY:' in n.risk_category])
-                high_risk = len([n for n in final_news if n.risk_level == 'HIGH' and 'RISK:' in n.risk_category])
+                high_risk_count = len([n for n in final_news if n.risk_level == 'HIGH' and 'RISK:' in n.risk_category])
                 med_opp = len([n for n in final_news if n.risk_level == 'MEDIUM' and 'OPPORTUNITY:' in n.risk_category])
                 med_risk = len([n for n in final_news if n.risk_level == 'MEDIUM' and 'RISK:' in n.risk_category])
                 low_opp = len([n for n in final_news if n.risk_level == 'LOW' and 'OPPORTUNITY:' in n.risk_category])
-                low_risk = len([n for n in final_news if n.risk_level == 'LOW' and 'RISK:' in n.risk_category])
+                low_risk_count = len([n for n in final_news if n.risk_level == 'LOW' and 'RISK:' in n.risk_category])
                 
-                # 요약 텍스트 생성
-                if high_opp + high_risk > 0:
-                    risk_summary.append(f"HIGH(위험{high_risk}/기회{high_opp})")
+                risk_summary = []
+                if high_opp + high_risk_count > 0:
+                    risk_summary.append(f"HIGH(위험{high_risk_count}/기회{high_opp})")
                 if med_opp + med_risk > 0:
                     risk_summary.append(f"MED(위험{med_risk}/기회{med_opp})")
-                if low_opp + low_risk > 0:
-                    risk_summary.append(f"LOW(위험{low_risk}/기회{low_opp})")
+                if low_opp + low_risk_count > 0:
+                    risk_summary.append(f"LOW(위험{low_risk_count}/기회{low_opp})")
                 
                 subject_admin = f"[관리자] 삼성물산 - {' / '.join(risk_summary) if risk_summary else '새 뉴스 없음'} - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
                 
-                # 관리자에게 전송
                 self.send_email_to_recipients(html_content_admin, subject_admin, [self.email_config['admin_email']])
                 logger.info(f"📧 관리자 전체 리포트 전송 완료 (전체 {len(final_news)}건)")
             
-            # 캐시 저장
+            # 11. 캐시 저장
             company_cache.save_cache()
+            company_cache.save_recent_news()
             
             # 통계 로그
             logger.info("\n📊 모니터링 결과:")
             logger.info(f"  - HIGH RISK: {len(high_risk)}건 {'(긴급알림 발송)' if high_risk else ''}")
             logger.info(f"  - MEDIUM RISK: {len(medium_risk)}건")
             logger.info(f"  - LOW RISK: {len(low_risk)}건")
-            if company_level:
-                logger.info(f"  - COMPANY: {len(company_level)}건")
             
             logger.info("✅ 회사 모니터링 완료")
             return True
