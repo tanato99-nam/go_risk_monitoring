@@ -3,6 +3,8 @@ AI 기반 글로벌 리스크 모니터링 시스템 - 스케줄링 및 회사 �
 24개국 실시간 뉴스 모니터링 with AI 분석
 """
 
+from __future__ import annotations
+
 import os
 import json
 import smtplib
