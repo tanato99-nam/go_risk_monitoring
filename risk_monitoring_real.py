@@ -913,7 +913,7 @@ class AIRiskMonitoringSystem:
                         country_code=country_code or 'global',
                         thumbnail=item.get('thumbnail', ''),
                         search_type=search_type,
-                        collected_at=now.isoformat()
+                        collected_at=datetime.now().isoformat()  # 정확한 수집 시간 기록
                     )
                     results.append(news_item)
                     
@@ -1076,13 +1076,25 @@ class AIRiskMonitoringSystem:
         
         # 3. 한국 미디어 검색 추가 (기존 유지)
         logger.info("\n🇰🇷 한국 언론 내 회사 뉴스 모니터링")
+        
+        # 날짜 필터를 쿼리에 직접 포함
+        current_year = datetime.now().year
+        current_month = datetime.now().month
+        
         for site in self.korean_media.get('sites', []):
             if not site.get('active', False):
                 continue
             
             for term in self.korean_media.get('search_terms', []):
-                query = f'{site["selector"]} "{term}"'
-                logger.info(f"  - {site['name']}: {term}")
+                # 쿼리에 연도 제한 추가
+                if current_month == 1:  # 1월인 경우 작년 12월도 포함
+                    year_filter = f"({current_year} OR {current_year-1})"
+                else:
+                    year_filter = f"{current_year}"
+                
+                query = f'{site["selector"]} "{term}" {year_filter}'
+                logger.info(f"  - {site['name']}: {term} (연도 제한: {year_filter})")
+                
                 news = self.search_news(
                     query=query,
                     country_code='kr',
@@ -1090,16 +1102,51 @@ class AIRiskMonitoringSystem:
                     search_type='web'
                 )
                 
+                # 추가 필터링: 신뢰할 수 없는 날짜 제거
+                filtered_news = []
                 for item in news:
-                    item.country = "Samsung C&T"
-                    item.country_ko = "삼성물산"
-                    item.country_code = "samsung"
+                    # AI를 통한 추가 검증 (선택적)
+                    if self._verify_news_recency(item):
+                        item.country = "Samsung C&T"
+                        item.country_ko = "삼성물산"
+                        item.country_code = "samsung"
+                        filtered_news.append(item)
+                    else:
+                        logger.warning(f"  ✗ 오래된 뉴스 제외: {item.title[:50]}...")
                 
-                all_news.extend(news)
+                logger.info(f"    → {len(news)}건 중 {len(filtered_news)}건 유효")
+                all_news.extend(filtered_news)
                 time.sleep(1)
-        
+                
         logger.info(f"\n✅ 총 {len(all_news)}건 수집 완료")
         return all_news
+    
+    def _verify_news_recency(self, news_item: NewsItem) -> bool:
+        """AI를 사용한 뉴스 최신성 검증"""
+        try:
+            prompt = f"""
+            다음 뉴스가 최근 7일 이내의 뉴스인지 확인해주세요.
+            
+            제목: {news_item.title}
+            내용: {news_item.snippet}
+            URL: {news_item.link}
+            
+            현재 날짜: {datetime.now().strftime('%Y년 %m월 %d일')}
+            
+            응답 형식:
+            최신뉴스: (Yes/No)
+            추정날짜: (YYYY-MM-DD 형식 또는 Unknown)
+            근거: (판단 근거 한 문장)
+            """
+            
+            response = self.analyzer.model.generate_content(prompt)
+            result = response.text.lower()
+            
+            return 'yes' in result and '최신뉴스: yes' in result
+            
+        except Exception as e:
+            logger.error(f"AI 날짜 검증 실패: {e}")
+            return True  # 검증 실패시 포함 (보수적 접근)
     
     def _is_within_days(self, date_string: str, days: int = 7) -> bool:
         """통일된 날짜 검증 함수 - 지정된 일수 이내인지 확인"""
